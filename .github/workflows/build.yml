@@ -1,13 +1,23 @@
+# Собирает образ и публикует в GitHub Container Registry: ghcr.io/<ваш-логин>/gimps-gpu:latest
 name: build-image
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md"]          # правка README не пересобирает образ
   workflow_dispatch:
     inputs:
       prpll_ref:
-        description: "PRPLL commit/branch (gwoltman/gpuowl), напр. master"
+        description: "PRPLL commit/branch (gwoltman/gpuowl). Пусто = версия из build.sh"
         required: false
-        default: "5ce7df1"
+        default: ""
+      mfaktc_ref:
+        description: "mfaktc commit/tag (primesearch/mfaktc). Пусто = версия из build.sh"
+        required: false
+        default: ""
+      cuda_ver:
+        description: "Версия CUDA базового образа nvidia/cuda"
+        required: false
+        default: "12.9.1"
 permissions:
   contents: read
   packages: write
@@ -16,10 +26,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
+      - name: Free disk space (CUDA devel image is big)
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Image name (lowercase)
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/gimps-gpu" >> "$GITHUB_ENV"
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/gimps-gpu" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Syntax check
+        run: |
+          for f in build.sh gimps-start gimps-stop gimps-status gimps-backup gimps-watch gimps-cpu-setup bootstrap.sh; do bash -n "$f"; done
+          python3 -m py_compile gimps-monitor gimps-notify
+      - name: bootstrap.sh is up to date
+        run: |
+          bash make-bootstrap.sh   # через bash: при загрузке файлов через веб GitHub бит +x теряется
+          git -c core.fileMode=false diff --exit-code bootstrap.sh || { echo "bootstrap.sh устарел: запустите ./make-bootstrap.sh и закоммитьте"; exit 1; }
+      - name: Monitor test (sample logs, no GPU)
+        run: bash tests/test-monitor.sh
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -31,9 +53,13 @@ jobs:
           context: .
           push: true
           build-args: |
-            PRPLL_REF=${{ github.event.inputs.prpll_ref || '5ce7df1' }}
+            CUDA_VER=${{ github.event.inputs.cuda_ver || '12.9.1' }}
+            PRPLL_REF=${{ github.event.inputs.prpll_ref }}
+            MFAKTC_REF=${{ github.event.inputs.mfaktc_ref }}
+          # latest — для экспериментов; в шаблоне vast.ai надёжнее указывать неизменяемый тег коммита (sha-…)
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:sha-${{ env.SHORT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
