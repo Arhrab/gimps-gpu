@@ -9,18 +9,16 @@ ARG PRPLL_REF
 ARG MFAKTC_REF
 ARG APN_REF
 ARG MFAKTC_ARCHS
-COPY scripts/ /src/scripts/
+COPY build.sh gimps-start gimps-stop gimps-status /src/scripts/
 RUN chmod +x /src/scripts/* && /src/scripts/build.sh deps-build \
  && PRPLL_REF=${PRPLL_REF:-5ce7df1} MFAKTC_REF=${MFAKTC_REF:-0.24.1} \
     APN_REF=${APN_REF:-b4426a13f96c874cf6202aefa3b8f97345069245} \
     MFAKTC_ARCHS="${MFAKTC_ARCHS:-70 75 80 86 89 90 100 120}" \
     /src/scripts/build.sh build
 
-# ---------- рантайм (маленький образ: base + nvrtc) ----------
+# ---------- рантайм ----------
 FROM nvidia/cuda:${CUDA_VER}-base-${UBUNTU}
-LABEL org.opencontainers.image.title="gimps-gpu" \
-      org.opencontainers.image.description="GIMPS Mersenne prime search on NVIDIA GPUs: PRPLL-NTT, mfaktc, AutoPrimeNet"
-COPY scripts/build.sh /tmp/build.sh
+COPY build.sh /tmp/build.sh
 RUN bash /tmp/build.sh deps-runtime && rm /tmp/build.sh
 COPY --from=build /opt/gimps /opt/gimps
 RUN echo /opt/gimps/lib > /etc/ld.so.conf.d/gimps.conf && ldconfig \
