@@ -1,22 +1,47 @@
 #!/usr/bin/env bash
-# Сводка: GPU, задания и ETA по каждому воркеру, последние строки логов.
+# Сводка: GPU, CPU, задания по каждому воркеру, последние события прогресса, бэкап.
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
 
 echo "===== GPU ====="
-nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,memory.used --format=csv
+nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,power.limit,clocks.sm,clocks.mem,memory.used \
+  --format=csv 2>/dev/null || echo "nvidia-smi недоступен"
 echo
 for d in "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu*; do
   [ -d "$d" ] || continue
   n="$(basename "$d")"
   echo "===== $n ====="
   echo "--- задания (worktodo):"
-  cat "$d"/worktodo*.txt 2>/dev/null | grep -v '^\s*$' || echo "(пусто)"
-  echo "--- отправлено результатов: $(cat "$d"/results*.txt 2>/dev/null | grep -c . )"
-  echo "--- лог воркера:"
-  tail -n 4 "$DATA_DIR/logs/${n}.log" 2>/dev/null
+  cat "$d"/worktodo*.txt 2>/dev/null | grep -v '^\s*$' | head -5 || true
+  q=$(cat "$d"/worktodo*.txt 2>/dev/null | grep -c . ); echo "    (всего в очереди: $q)"
+  echo "--- результатов записано: $(cat "$d"/results*.txt 2>/dev/null | grep -c . )"
+  [ -s "$d/tune.txt" ] && echo "--- PRPLL tune.txt: есть (оптимизировано под эту GPU)"
   echo "--- лог AutoPrimeNet:"
-  tail -n 3 "$DATA_DIR/logs/apn-${n#*-}.log" 2>/dev/null
+  tail -n 2 "$DATA_DIR/logs/apn-${n#*-}.log" 2>/dev/null
   echo
 done
+if [ -d "$DATA_DIR/cpu" ]; then
+  echo "===== CPU (mprime) ====="
+  if pgrep -x mprime >/dev/null; then
+    ps -o pid,ni,%cpu,rss,etime,cmd -C mprime | sed 's/^/    /'
+  else
+    echo "    mprime не запущен"
+  fi
+  grep -h -E '^(Factor|Pfactor|Pminus1|PRP|ECM2|DoubleCheck|Test)=' "$DATA_DIR"/cpu/worktodo.txt 2>/dev/null | head -3 | sed 's/^/    /'
+  tail -n 2 "$DATA_DIR/logs/cpu.log" 2>/dev/null | sed 's/^/    /'
+  echo
+fi
+echo "===== последние события (полный живой журнал: gimps-watch) ====="
+tail -n 8 "$DATA_DIR/logs/progress.log" 2>/dev/null || echo "    журнал ещё пуст"
+if [ -f "$DATA_DIR/logs/backup.log" ]; then
+  echo
+  echo "===== внешний бэкап ====="
+  echo "слот: $(cat "$DATA_DIR/.backup-slot" 2>/dev/null || echo 1) | последний успешный: $(cat "$DATA_DIR/logs/last-backup" 2>/dev/null || echo 'ещё не было')"
+  tail -n 2 "$DATA_DIR/logs/backup.log"
+fi
+for f in "$DATA_DIR"/.disabled-*; do
+  [ -f "$f" ] || continue
+  echo "!!! ВЫКЛЮЧЕН $(basename "$f" | sed 's/^.disabled-//'): $(cat "$f")  — вернуть: rm $f"
+done
 [ -f "$DATA_DIR/.stop" ] && echo "(стоп-флаг установлен — воркеры остановлены)"
+exit 0

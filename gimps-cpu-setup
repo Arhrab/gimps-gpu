@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Первичная настройка mprime (Prime95 для Linux) для расчётов на CPU параллельно с GPU.
+# Вызывается из gimps-start автоматически; вручную: gimps-cpu-setup [--force]
+# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_MEM_GB (auto), DATA_DIR
+set -uo pipefail
+DATA_DIR="${DATA_DIR:-/data}"
+[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+D="$DATA_DIR/cpu"; mkdir -p "$D"; cd "$D" || exit 1
+for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
+
+
+# сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
+alloc="$(nproc)"
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( (q + p - 1) / p ))
+elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+  q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+  [ "$q" -gt 0 ] && alloc=$(( (q + p - 1) / p ))
+fi
+[ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
+tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
+phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
+# одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
+CORES="${CPU_CORES:-$(( phys > 1 ? phys - 1 : 1 ))}"
+
+# память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
+mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
+  mem_kb=$(( $(cat /sys/fs/cgroup/memory.max) / 1024 ))
+fi
+MEM="${CPU_MEM_GB:-$(( mem_kb / 1024 / 1024 / 2 ))}"; [ "$MEM" -gt 64 ] && MEM=64; [ "$MEM" -lt 1 ] && MEM=1
+
+# Число потоков mprime — явно в local.txt: в контейнере mprime видит все ядра хоста, а не выделенные нам.
+# (Ключи NumWorkers / CoresPerTest — из local.txt Prime95 v29+; mprime перечитывает их при старте.)
+enforce_cores() {
+  [ -f local.txt ] || return 0
+  local k v
+  for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    if grep -q "^$k=" local.txt; then sed -i "s/^$k=.*/$k=$v/" local.txt; else echo "$k=$v" >> local.txt; fi
+  done
+}
+
+if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
+  enforce_cores
+  echo "mprime уже настроен ($D/prime.txt), потоков: $CORES. Перенастроить: gimps-cpu-setup --force"; exit 0
+fi
+
+USERID="${GIMPS_USER:-ANONYMOUS}"
+NAME="${GIMPS_NAME:-cloud}-cpu"
+TYPE="${CPU_WORKPREF:-4}"
+echo "mprime: пользователь=$USERID, компьютер=$NAME, тип работы=$TYPE, ядер=$CORES (выделено CPU: $alloc), память stage 2=$MEM ГиБ"
+[ "${1:-}" = "--force" ] && rm -f prime.txt local.txt
+timeout 900 expect /opt/gimps/share/mprime-setup.exp "$USERID" "$NAME" "$TYPE" "$CORES" "$MEM" > setup.log 2>&1
+rc=$?
+if grep -qs '^V5UserID=' prime.txt; then
+  enforce_cores
+  echo "mprime настроен (лог: $D/setup.log), потоков: $CORES"; exit 0
+fi
+echo "mprime: автонастройка не удалась (rc=$rc), см. $D/setup.log. Можно настроить вручную: cd $D && ./mprime -m"
+exit 1

@@ -2,3 +2,4 @@
 *.md
 make-bootstrap.sh
 bootstrap.sh
+tests

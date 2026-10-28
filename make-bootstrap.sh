@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 cat <<'HDR'
 #!/usr/bin/env bash
 # GIMPS GPU bootstrap — установка БЕЗ Docker-реестра, прямо на VM/контейнере с CUDA devel
-# (например, образ nvidia/cuda:12.8.1-devel-ubuntu24.04 на vast.ai / RunPod, или Ubuntu VM с CUDA Toolkit).
+# (например, образ nvidia/cuda:12.9.1-devel-ubuntu24.04 на vast.ai / RunPod, или Ubuntu VM с CUDA Toolkit).
 #   bash bootstrap.sh                       # собрать (3–6 минут)
 #   GIMPS_USER=<логин> gimps-start --daemon # запустить
 # Сгенерировано make-bootstrap.sh — не редактируйте вручную.
@@ -15,7 +15,7 @@ set -euo pipefail
 D=/opt/gimps-src/scripts
 mkdir -p "$D"
 HDR
-for f in scripts/build.sh scripts/gimps-start scripts/gimps-stop scripts/gimps-status; do
+for f in build.sh gimps-start gimps-stop gimps-status gimps-backup gimps-monitor gimps-watch gimps-cpu-setup gimps-notify mprime-setup.exp; do
   n="$(basename "$f")"
   echo "cat > \"\$D/$n\" <<'__GIMPS_EOF__'"
   cat "$f"

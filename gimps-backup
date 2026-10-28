@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# Резервное копирование состояния GIMPS ($DATA_DIR: чекпойнты PRPLL/mfaktc/mprime, proof-остатки, задания,
+# prime.ini, кэш тюнинга) наружу — в Cloudflare R2 / любое S3, Google Drive или любой remote rclone.
+#
+#   gimps-backup            — синхронизировать сейчас
+#   gimps-backup loop       — синхронизировать каждые BACKUP_INTERVAL_MIN минут (запускается из gimps-start)
+#   gimps-backup claim      — (на пустой машине) выбрать слот и восстановить из него; вызывается gimps-start
+#   gimps-backup restore    — восстановить из текущего слота вручную (FORCE=1 — даже если слот «живой»)
+#   gimps-backup release    — убрать из слота чекпойнты GPU-заданий (после gimps-stop --unreserve)
+#   gimps-backup ls         — что лежит в хранилище по всем слотам
+#   gimps-backup check      — проверить доступ к хранилищу
+#
+# Слоты: BACKUP_NAME, BACKUP_NAME-2 … BACKUP_NAME-9. Каждая работающая машина держит свой слот и пишет в него
+# «пульс» (owner.txt) каждые 2 минуты. Новая машина берёт слот брошенной машины (данные есть, пульса нет
+# дольше BACKUP_STALE_SEC) и продолжает её задания; если таких нет — первый пустой слот. Возраст пульса
+# считается по часам хранилища, а не машин.
+#
+# Cloudflare R2: BACKUP_BUCKET, BACKUP_R2_ACCOUNT_ID, BACKUP_S3_ACCESS_KEY, BACKUP_S3_SECRET_KEY
+# S3 (B2, AWS…):  BACKUP_BUCKET, BACKUP_S3_ENDPOINT, BACKUP_S3_ACCESS_KEY, BACKUP_S3_SECRET_KEY, BACKUP_S3_REGION
+# Google Drive:   BACKUP_GDRIVE_TOKEN, BACKUP_GDRIVE_CLIENT_ID, BACKUP_GDRIVE_CLIENT_SECRET, BACKUP_GDRIVE_FOLDER
+# Другое:         BACKUP_REMOTE — готовый путь rclone для первого слота (с RCLONE_CONFIG_* переменными)
+# Общие:
+#   BACKUP_NAME            базовое имя слотов. По умолч. gimps
+#   BACKUP_INTERVAL_MIN    период синхронизации, мин. По умолч. 30
+#   BACKUP_S3_CHUNK_SIZE   размер части multipart-загрузки S3/R2. По умолч. 64M
+#   BACKUP_PROOF           0 = не копировать proof-остатки. По умолч. 1
+#   BACKUP_MAX_DELETE      не удалять в хранилище больше N файлов за раз. По умолч. 300
+#   BACKUP_ALLOW_SHRINK    1 = разрешить синхронизацию, даже если локально пропала папка воркера (иначе — отказ)
+#   BACKUP_STALE_SEC       через сколько секунд без пульса слот считается брошенным. По умолч. 360
+#
+# Коды возврата claim/restore: 0 — готово (восстановлено или чистый старт), 5 — хранилище недоступно/ошибка,
+# 6 — все слоты заняты живыми машинами, 4 — слот занят живой машиной (restore без FORCE).
+set -uo pipefail
+DATA_DIR="${DATA_DIR:-/data}"
+mkdir -p "$DATA_DIR/logs"
+[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+
+BASE_NAME="${BACKUP_NAME:-gimps}"
+INTERVAL="${BACKUP_INTERVAL_MIN:-30}"
+STALE_SEC="${BACKUP_STALE_SEC:-360}"
+MAX_SLOTS=9
+
+if [ -n "${BACKUP_REMOTE:-}" ]; then
+  BASE_PATH="${BACKUP_REMOTE%/}"
+elif [ -n "${BACKUP_GDRIVE_TOKEN:-}" ]; then
+  export RCLONE_CONFIG_GIMPSGD_TYPE=drive
+  export RCLONE_CONFIG_GIMPSGD_SCOPE=drive.file          # rclone видит только свои файлы, а не весь Диск
+  export RCLONE_CONFIG_GIMPSGD_TOKEN="$BACKUP_GDRIVE_TOKEN"
+  export RCLONE_CONFIG_GIMPSGD_CLIENT_ID="${BACKUP_GDRIVE_CLIENT_ID:?нужен BACKUP_GDRIVE_CLIENT_ID}"
+  export RCLONE_CONFIG_GIMPSGD_CLIENT_SECRET="${BACKUP_GDRIVE_CLIENT_SECRET:?нужен BACKUP_GDRIVE_CLIENT_SECRET}"
+  export RCLONE_CONFIG_GIMPSGD_USE_TRASH=false
+  BASE_PATH="gimpsgd:${BACKUP_GDRIVE_FOLDER:-gimps-backup}/${BASE_NAME}"
+elif [ -n "${BACKUP_BUCKET:-}" ]; then
+  export RCLONE_CONFIG_GIMPSS3_TYPE=s3
+  export RCLONE_CONFIG_GIMPSS3_PROVIDER=Other
+  if [ -n "${BACKUP_R2_ACCOUNT_ID:-}" ]; then          # Cloudflare R2: адрес и регион из Account ID
+    export RCLONE_CONFIG_GIMPSS3_PROVIDER=Cloudflare
+    BACKUP_S3_ENDPOINT="${BACKUP_S3_ENDPOINT:-https://${BACKUP_R2_ACCOUNT_ID}.r2.cloudflarestorage.com}"
+    BACKUP_S3_REGION="${BACKUP_S3_REGION:-auto}"
+  fi
+  export RCLONE_CONFIG_GIMPSS3_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY:?нужен BACKUP_S3_ACCESS_KEY}"
+  export RCLONE_CONFIG_GIMPSS3_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY:?нужен BACKUP_S3_SECRET_KEY}"
+  export RCLONE_CONFIG_GIMPSS3_ENDPOINT="${BACKUP_S3_ENDPOINT:?нужен BACKUP_S3_ENDPOINT}"
+  export RCLONE_CONFIG_GIMPSS3_REGION="${BACKUP_S3_REGION:-us-east-1}"
+  export RCLONE_CONFIG_GIMPSS3_NO_CHECK_BUCKET=true
+  export RCLONE_CONFIG_GIMPSS3_CHUNK_SIZE="${BACKUP_S3_CHUNK_SIZE:-64M}"
+  BASE_PATH="gimpss3:${BACKUP_BUCKET}/${BASE_NAME}"
+else
+  echo "Бэкап не настроен (нет BACKUP_BUCKET / BACKUP_GDRIVE_TOKEN / BACKUP_REMOTE)"; exit 3
+fi
+
+slot_path() { if [ "$1" -le 1 ]; then echo "$BASE_PATH"; else echo "$BASE_PATH-$1"; fi; }
+SLOT_FILE="$DATA_DIR/.backup-slot"          # номер слота этой машины (в бэкап не попадает)
+SLOT="$(cat "$SLOT_FILE" 2>/dev/null || echo 1)"; [[ "$SLOT" =~ ^[0-9]+$ ]] || SLOT=1
+REMOTE="$(slot_path "$SLOT")"
+
+[ -f "$DATA_DIR/.machine-id" ] || head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DATA_DIR/.machine-id"
+MID="$(cat "$DATA_DIR/.machine-id")"
+OK_MARK="$DATA_DIR/.backup-ok"              # эта машина имеет право писать в свой слот
+SNAP="$DATA_DIR/.snap"                       # мгновенный снимок (жёсткие ссылки) для согласованной загрузки
+LOCK="$DATA_DIR/.backup.lock"
+
+RC=(rclone --config /dev/null --transfers 4 --checkers 16 --retries 3 --retries-sleep 10s
+    --low-level-retries 10 --contimeout 30s --timeout 5m --stats 0 -q)
+EXCL=(--exclude "logs/**" --exclude ".snap/**" --exclude "*.new" --exclude "~lock" --exclude ".stop"
+      --exclude "gimps-start.pid" --exclude ".machine-id" --exclude ".backup-ok" --exclude ".backup-slot"
+      --exclude ".backup.lock" --exclude ".gimps-start.lock" --exclude "kernel-cache/**" --exclude "gimps.env"
+      --exclude "tune-run.*/**" --exclude "**/.lock" --exclude "*.lck" --exclude "*.write"
+      --exclude ".selftest-ok-*" --exclude ".disabled-*" --exclude ".pid-*" --exclude ".restored-from-backup"
+      --exclude ".monitor.lock" --exclude "gpuowl-*.log" --exclude "autoprimenet.log*")
+[ "${BACKUP_PROOF:-1}" = "0" ] && EXCL+=(--exclude "/*/*/proof/**")   # <gpu-dir>/<exponent>/proof/<k>
+
+ts() { date '+%F %T'; }
+log() { echo "[$(ts)] backup[$(basename "$REMOTE")]: $*"; }
+
+# локально есть рабочие данные?
+local_has_data() { ls "$DATA_DIR"/*/prime.ini "$DATA_DIR"/cpu/prime.txt >/dev/null 2>&1; }
+
+# Возраст файла в хранилище по часам ХРАНИЛИЩА (пишем пробу и сравниваем времена изменения). Печатает секунды.
+# Код: 0 — ок, 1 — файла нет, 2 — ошибка доступа.
+remote_age() {
+  local dir="$1" name="$2" probe=".probe-$MID" js
+  echo x | "${RC[@]}" rcat "$dir/$probe" || return 2
+  js="$("${RC[@]}" lsjson --use-server-modtime --files-only "$dir" 2>/dev/null)"; local rc=$?
+  "${RC[@]}" deletefile "$dir/$probe" >/dev/null 2>&1
+  [ $rc -eq 0 ] || return 2
+  python3 -c '
+import json, re, sys, datetime as d
+def t(s):
+    m = re.match(r"(.*?\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)?$", s)
+    frac = (m.group(2) or "")[:7]; tz = m.group(3) or "Z"
+    return d.datetime.fromisoformat(m.group(1) + frac + ("+00:00" if tz == "Z" else tz))
+items = {x["Name"]: x["ModTime"] for x in json.loads(sys.stdin.read() or "[]")}
+name, probe = sys.argv[1], sys.argv[2]
+if name not in items: sys.exit(1)
+print(max(0, int((t(items[probe]) - t(items[name])).total_seconds())))' "$name" "$probe" <<<"$js"
+}
+
+# Состояние слота: печатает empty | stale | live | mine. Код 2 — ошибка доступа.
+slot_state() {
+  local p="$1" list rc owner omid age has_data=0
+  list="$("${RC[@]}" lsf --max-depth 1 "$p" 2>/dev/null)"; rc=$?
+  if [ $rc -ne 0 ] && [ $rc -ne 3 ]; then return 2; fi     # 3 = «папки нет» — это просто пусто
+  grep -qx 'data/' <<<"$list" && has_data=1
+  if grep -qx 'owner.txt' <<<"$list"; then
+    owner="$("${RC[@]}" cat "$p/owner.txt" 2>/dev/null)" || return 2
+    read -r omid _ <<<"$owner"
+    if [ "$omid" = "$MID" ]; then echo mine; return 0; fi
+    age="$(remote_age "$p" owner.txt)"; rc=$?
+    [ $rc -eq 2 ] && return 2
+    if [ $rc -eq 0 ] && [ "$age" -lt "$STALE_SEC" ]; then echo live; return 0; fi
+  fi
+  if [ $has_data = 1 ]; then echo stale; else echo empty; fi
+}
+
+heartbeat() { echo "$MID $(date +%s) $(hostname) $(ts)" | "${RC[@]}" rcat "$REMOTE/owner.txt"; }
+
+# 0 — можно писать в свой слот; 1 — в нём пишет другая живая машина; 2 — ошибка доступа
+owner_ok() {
+  local s; s="$(slot_state "$REMOTE")" || return 2
+  [ "$s" = live ] && return 1 || return 0
+}
+
+with_lock() { ( flock -w 1800 9 || { log "не дождался блокировки"; exit 1; }; "$@" ) 9>"$LOCK"; }
+
+# Мгновенный снимок на жёстких ссылках: место не занимает, файлы, заменяемые через переименование
+# (сейвфайлы PRPLL, чекпойнты mfaktc), в снимке не меняются. Сначала всё, кроме proof-остатков, потом остатки —
+# так каждому сейвфайлу в снимке соответствуют все остатки до его итерации. Мелкие файлы (их пишут «на месте»)
+# копируются по-настоящему.
+snap_make() {
+  rm -rf "$SNAP"; mkdir -p "$SNAP"
+  local prune=( \( -path ./.snap -o -path ./logs -o -name 'tune-run.*' -o -name 'kernel-cache' \) -prune -o )
+  ( cd "$DATA_DIR" && find . -mindepth 1 "${prune[@]}" -type f ! -path '*/proof/*' -print0 \
+      | xargs -0 -r cp -l --parents -t "$SNAP" 2>/dev/null )
+  ( cd "$DATA_DIR" && find . -mindepth 1 "${prune[@]}" -type f -path '*/proof/*' -print0 \
+      | xargs -0 -r cp -l --parents -t "$SNAP" 2>/dev/null )
+  find "$SNAP" -type f -size -2048k -print0 | while IFS= read -r -d '' f; do
+    cp -p "$f" "$f.cp.$$" 2>/dev/null && mv -f "$f.cp.$$" "$f"
+  done
+  return 0
+}
+
+# Отказ, если в хранилище есть папка воркера (prime.ini / cpu/prime.txt), которой нет локально:
+# синхронизация удалила бы её задания из бэкапа.
+shrink_guard() {
+  [ "${BACKUP_ALLOW_SHRINK:-0}" = "1" ] && return 0
+  local f missing=""
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ ! -f "$SNAP/$f" ] && missing+="$f "
+  done < <("${RC[@]}" lsf -R --files-only --include "*/prime.ini" --include "cpu/prime.txt" "$REMOTE/data" 2>/dev/null)
+  if [ -n "$missing" ]; then
+    log "ОТКАЗ: в хранилище есть, а локально нет: $missing— бэкап не трогаю (если так и задумано: BACKUP_ALLOW_SHRINK=1)"
+    return 1
+  fi
+}
+
+do_sync() {
+  if [ ! -f "$OK_MARK" ]; then
+    # эта машина ещё ни разу не восстанавливалась и не писала: не затираем чужой бэкап
+    local s; s="$(slot_state "$REMOTE")"; local rc=$?
+    if [ $rc -ne 0 ]; then log "хранилище недоступно — синхронизация пропущена"; return 1; fi
+    if [ "$s" = stale ] && ! local_has_data; then
+      log "в слоте есть данные, а локально пусто — сначала gimps-backup claim/restore. Пропускаю."; return 1
+    fi
+    touch "$OK_MARK"
+  fi
+  owner_ok; case $? in
+    1) log "в слот пишет ДРУГАЯ живая машина — синхронизация пропущена (одинаковый слот на двух машинах?)"; return 1 ;;
+    2) log "хранилище недоступно — синхронизация пропущена"; return 1 ;;
+  esac
+  heartbeat || { log "не удалось записать пульс"; return 1; }
+  snap_make
+  shrink_guard || { rm -rf "$SNAP"; return 1; }
+  if "${RC[@]}" sync "$SNAP" "$REMOTE/data" "${EXCL[@]}" --max-delete "${BACKUP_MAX_DELETE:-300}"; then
+    date '+%F %T' > "$DATA_DIR/logs/last-backup"
+    log "ok ($(du -sh --exclude=logs --exclude=.snap "$DATA_DIR" 2>/dev/null | cut -f1))"
+    rm -rf "$SNAP"
+  else
+    log "ошибка синхронизации (повторю в следующий раз)"; rm -rf "$SNAP"; return 1
+  fi
+}
+
+restore_from() {   # $1 — слот
+  local p; p="$(slot_path "$1")"
+  REMOTE="$p"
+  log "восстанавливаю $p/data -> $DATA_DIR ..."
+  if "${RC[@]}" copy "$p/data" "$DATA_DIR" "${EXCL[@]}"; then
+    echo "$1" > "$SLOT_FILE"; touch "$OK_MARK" "$DATA_DIR/.restored-from-backup"; heartbeat
+    log "восстановлено: $(cd "$DATA_DIR" && ls -d *-gpu* cpu 2>/dev/null | tr '\n' ' ')"
+    return 0
+  fi
+  log "ошибка восстановления"; return 5
+}
+
+do_claim() {
+  if local_has_data; then
+    [ -f "$SLOT_FILE" ] || echo 1 > "$SLOT_FILE"
+    log "локальные данные есть — работаю со своим слотом"; return 0
+  fi
+  local i s stale="" empty=""
+  for i in $(seq 1 $MAX_SLOTS); do
+    s="$(slot_state "$(slot_path "$i")")" || { log "хранилище недоступно (сеть / ключи / бакет) — не стартую с нуля"; return 5; }
+    case "$s" in
+      stale|mine) [ -z "$stale" ] && stale=$i ;;
+      empty)      [ -z "$empty" ] && empty=$i ;;
+    esac
+    [ -n "$stale" ] && break                 # брошенная машина важнее пустого слота
+  done
+  if [ -n "$stale" ]; then
+    REMOTE="$(slot_path "$stale")"; heartbeat || return 5
+    sleep $(( 3 + RANDOM % 6 ))              # защита от гонки двух новых машин
+    s="$(slot_state "$REMOTE")" || return 5
+    if [ "$s" != mine ]; then log "слот $stale только что заняла другая машина — ищу дальше"; do_claim; return $?; fi
+    log "слот $(basename "$REMOTE") брошен — продолжаю его задания"
+    restore_from "$stale"; return $?
+  fi
+  if [ -n "$empty" ]; then
+    echo "$empty" > "$SLOT_FILE"; REMOTE="$(slot_path "$empty")"
+    heartbeat || return 5
+    sleep $(( 3 + RANDOM % 6 ))
+    s="$(slot_state "$REMOTE")" || return 5
+    if [ "$s" != mine ]; then rm -f "$SLOT_FILE"; log "слот $empty только что заняла другая машина — ищу дальше"; do_claim; return $?; fi
+    touch "$OK_MARK"
+    log "брошенных слотов нет — чистый старт в пустом слоте $(basename "$REMOTE")"; return 0
+  fi
+  log "все $MAX_SLOTS слотов заняты живыми машинами"; return 6
+}
+
+# После gimps-stop --unreserve: задания GPU возвращены в PrimeNet — их чекпойнты из слота удаляем,
+# чтобы следующая машина не продолжила уже чужие задания. Папка cpu (mprime) и кэш тюнинга остаются.
+do_release() {
+  owner_ok; case $? in
+    1) log "слот занят другой живой машиной — не трогаю"; return 1 ;;
+    2) log "хранилище недоступно — освободить слот не удалось"; return 5 ;;
+  esac
+  local d n=0
+  while IFS= read -r d; do
+    [[ "$d" == *-gpu*/ ]] || continue
+    "${RC[@]}" purge "$REMOTE/data/${d%/}" && n=$((n + 1))
+  done < <("${RC[@]}" lsf --dirs-only --max-depth 1 "$REMOTE/data" 2>/dev/null)
+  echo "$MID $(date +%s) $(hostname) $(ts) released" | "${RC[@]}" rcat "$REMOTE/owner.txt"
+  log "слот освобождён: удалено папок GPU-воркеров — $n (задания возвращены в PrimeNet)"
+}
+
+do_restore() {
+  local s; s="$(slot_state "$REMOTE")" || { log "хранилище недоступно"; return 5; }
+  case "$s" in
+    empty) log "слот пуст — восстанавливать нечего"; return 0 ;;
+    live)  log "слот занят живой машиной. Если она точно мертва — подождите $((STALE_SEC/60)) мин или FORCE=1 gimps-backup restore"
+           [ "${FORCE:-0}" = "1" ] || return 4 ;;
+  esac
+  restore_from "$SLOT"
+}
+
+case "${1:-sync}" in
+  sync)    with_lock do_sync ;;
+  claim)   with_lock do_claim ;;
+  restore) with_lock do_restore ;;
+  release) with_lock do_release ;;
+  ls)      for i in $(seq 1 $MAX_SLOTS); do
+             p="$(slot_path "$i")"; s="$(slot_state "$p")" || { echo "$p: ошибка доступа"; continue; }
+             [ "$s" = empty ] && continue
+             echo "== $p ($s)$([ "$i" = "$SLOT" ] && echo ' ← эта машина')"
+             "${RC[@]}" cat "$p/owner.txt" 2>/dev/null; "${RC[@]}" size "$p/data" 2>/dev/null
+           done ;;
+  check)   echo test | "${RC[@]}" rcat "$REMOTE/.check" && "${RC[@]}" deletefile "$REMOTE/.check" \
+             && log "доступ к $REMOTE есть" || { log "НЕТ доступа к $REMOTE"; exit 5; } ;;
+  loop)
+    with_lock do_sync   # сразу при старте
+    t=0
+    while [ ! -f "$DATA_DIR/.stop" ]; do
+      sleep 10; t=$((t + 10))
+      [ -f "$DATA_DIR/.stop" ] && break
+      if [ $((t % (INTERVAL * 60))) -eq 0 ]; then with_lock do_sync
+      elif [ $((t % 120)) -eq 0 ] && [ -f "$OK_MARK" ]; then
+        owner_ok && heartbeat
+      fi
+    done ;;
+  *) echo "usage: gimps-backup [sync|loop|claim|restore|release|ls|check]"; exit 2 ;;
+esac

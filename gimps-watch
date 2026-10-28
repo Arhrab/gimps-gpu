@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Живой построчный журнал всех задач (GPU и CPU): новая задача с оценкой и снимком GPU/CPU,
+# прогресс на каждом 1%, результаты и засчитанный кредит. Выход: Ctrl+C (расчёт не останавливается).
+#   gimps-watch          — последние 30 событий + дальше в реальном времени
+#   gimps-watch -n 200   — показать больше истории
+#   gimps-watch GPU0     — только строки, где есть «GPU0» (или CPU, TF, PRP, M<экспонента>)
+DATA_DIR="${DATA_DIR:-/data}"
+LOG="$DATA_DIR/logs/progress.log"
+N=30
+[ "${1:-}" = "-n" ] && { N="${2:-30}"; shift 2; }
+FILTER="${1:-}"
+if [ ! -f "$LOG" ]; then
+  echo "Нет $LOG — gimps-start ещё не запущен?"; exit 1
+fi
+if ! pgrep -f "gimps-monitor" >/dev/null; then
+  echo "ВНИМАНИЕ: gimps-monitor не запущен — новые строки не появятся. Запуск: (gimps-monitor >/dev/null 2>&1 &)"
+fi
+echo "Журнал: $LOG  (выход: Ctrl+C — расчёт продолжится)"
+if [ -n "$FILTER" ]; then
+  tail -n "$N" -F "$LOG" 2>/dev/null | grep --line-buffered -F -- "$FILTER"
+else
+  tail -n "$N" -F "$LOG" 2>/dev/null
+fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Запуск GIMPS на всех (или выбранных) GPU: на каждую GPU — свой воркер (PRPLL или mfaktc)
-# и свой AutoPrimeNet, каждый в своей папке $DATA_DIR/<mode>-gpu<N>.
+# Запуск GIMPS на всех (или выбранных) GPU: на каждую GPU — свой воркер (PRPLL или mfaktc) и свой AutoPrimeNet
+# в папке $DATA_DIR/<mode>-gpu<N>; параллельно — mprime на CPU, живой журнал, сторожевой таймер, бэкап.
 #
 #   gimps-start            — в foreground (для Docker ENTRYPOINT)
 #   gimps-start --daemon   — в фоне (для onstart-скрипта vast.ai / RunPod / ssh)
@@ -10,13 +10,29 @@
 #   GIMPS_MODE       prp (PRPLL, тесты на простоту) | tf (mfaktc, trial factoring). По умолч. prp
 #   GIMPS_WORKPREF   тип работы PrimeNet. По умолч.: 150 (first-time PRP) для prp, 12 для tf
 #   GIMPS_GPUS       список GPU через запятую, напр. "0,1". По умолч. все
-#   GIMPS_NAME       префикс имени компьютера в PrimeNet. По умолч. "cloud"
+#   GIMPS_NAME       префикс имени компьютера в PrimeNet. По умолч. vast<номер инстанса> на vast.ai, иначе cloud
 #   GIMPS_DAYS_WORK  на сколько дней брать задания. По умолч. 1
+#   GIMPS_NO_NEW_WORK  1 = не брать новые задания (досчитать имеющиеся); 0 = снять запрет; пусто = снять только
+#                    на машине, которая продолжила чужой слот из бэкапа
 #   PRPLL_BACKEND    cuda | opencl. По умолч. cuda
-#   PRPLL_TUNE       1 = перед первым запуском прогнать "prpll -tune" (долго, но быстрее потом)
+#   PRPLL_WORKERS    сколько PRP-тестов одновременно на одной GPU (PRPLL -workers). По умолч. 1
+#   PRPLL_TUNE       auto (по умолч.) = один раз на модель GPU, версию PRPLL и диапазон экспонент прогнать
+#                    "prpll -tune" (кэш в $DATA_DIR/tune-cache, бэкапится); 0 = не тюнить; 1 = перетюнить
+#   PRPLL_TUNE_ARGS  параметры тюнинга. По умолч. "inplace,exp=<диапазон из worktodo>"
+#   PRPLL_CACHE      1 (по умолч.) = кэш скомпилированных ядер PRPLL (-cache): быстрый перезапуск
 #   PRPLL_ARGS       доп. аргументы PRPLL
+#   PRP_PROOF_POWER  proof power для PRP (по умолч. 6: 64 остатка, ~1,1 ГБ на тест 140M)
+#   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ, сообщается PrimeNet. По умолч. 5
+#   GPU_SELFTEST     1 (по умолч.) = перед работой PRP-самотест GPU на известном простом M1257787 (раз в сутки)
+#   WATCHDOG_MIN     перезапустить воркер, если его лог молчит дольше N минут. По умолч. 20 (0 — выкл.)
+#   EE_MAX_PER_HOUR  выключить PRP-воркер, если ошибок Gerbicz (EE) больше N за час. По умолч. 3
 #   APN_ARGS         доп. аргументы AutoPrimeNet (напр. "--cert-work")
-#   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ. По умолч. 30
+#   LOG_MAX_MB       обрезать логи больше N МБ (оставляя последние ~25%). По умолч. 20
+#   NOTIFY_*         уведомления в Telegram / вебхук — см. gimps-notify
+#   CPU_WORK         auto (по умолч.) | 0 — параллельно считать на CPU через mprime (Prime95)
+#   CPU_WORKPREF     тип работы для CPU: 4 = P-1 (по умолч.), 5 = ECM, 150 = PRP, 151 = PRP double-check
+#   CPU_CORES, CPU_MEM_GB — ресурсы mprime (по умолч. авто)
+#   BACKUP_*         внешний бэкап (R2/S3/Google Drive) — см. gimps-backup
 #   DATA_DIR         где хранить всё состояние. По умолч. /data
 set -uo pipefail
 
@@ -25,17 +41,38 @@ mkdir -p "$DATA_DIR/logs"
 [ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
 
 if [ "${1:-}" = "--daemon" ]; then
-  setsid nohup "$0" >>"$DATA_DIR/logs/gimps-start.log" 2>&1 < /dev/null &
-  echo "gimps-start запущен в фоне (pid $!). Лог: $DATA_DIR/logs/gimps-start.log ; статус: gimps-status"
+  GIMPS_DAEMON=1 setsid nohup "$0" >>"$DATA_DIR/logs/gimps-start.log" 2>&1 < /dev/null &
+  echo "gimps-start запущен в фоне (pid $!). Живой журнал: gimps-watch ; статус: gimps-status"
   exit 0
 fi
 
+# Один экземпляр на машину: блокировку держат gimps-start и все его воркеры (наследуют дескриптор),
+# поэтому повторный запуск откажет, пока жив хотя бы один процесс прошлого запуска.
+exec 8>"$DATA_DIR/.gimps-start.lock"
+if ! flock -n 8; then
+  echo "[$(date '+%F %T')] gimps-start уже работает (или остались его воркеры). Статус: gimps-status; остановить: gimps-stop" >&2
+  exit 1
+fi
+# одинаковая нумерация GPU у CUDA, OpenCL и nvidia-smi (иначе CUDA ставит «самую быструю» первой)
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+host="$(hostname)"
+if [[ "$host" =~ ^C\.([0-9]+)$ ]]; then def_name="vast${BASH_REMATCH[1]}"; else def_name="cloud"; fi
+export GIMPS_NAME="${GIMPS_NAME:-$def_name}"
+export BACKUP_NAME="${BACKUP_NAME:-gimps}"          # не зависит от имени машины — иначе новая машина не найдёт бэкап
 GIMPS_USER="${GIMPS_USER:-ANONYMOUS}"
 GIMPS_MODE="${GIMPS_MODE:-prp}"
-GIMPS_NAME="${GIMPS_NAME:-cloud}"
 GIMPS_DAYS_WORK="${GIMPS_DAYS_WORK:-1}"
 PRPLL_BACKEND="${PRPLL_BACKEND:-cuda}"
-PROOF_DISK_GB="${PROOF_DISK_GB:-30}"
+PRPLL_WORKERS="${PRPLL_WORKERS:-1}"
+PROOF_DISK_GB="${PROOF_DISK_GB:-5}"
+PRP_PROOF_POWER="${PRP_PROOF_POWER:-6}"
+export WATCHDOG_MIN="${WATCHDOG_MIN:-20}" EE_MAX_PER_HOUR="${EE_MAX_PER_HOUR:-3}"
+LOG_MAX_MB="${LOG_MAX_MB:-20}"
+# -proof / -cache / -workers из PRPLL_ARGS имеют приоритет
+[[ " ${PRPLL_ARGS:-} " == *" -proof "* ]] || PRPLL_ARGS="-proof $PRP_PROOF_POWER ${PRPLL_ARGS:-}"
+[[ "${PRPLL_CACHE:-1}" = "1" && " $PRPLL_ARGS " != *" -cache "* ]] && PRPLL_ARGS="-cache $PRPLL_ARGS"
+[[ "$PRPLL_WORKERS" -gt 1 && " $PRPLL_ARGS " != *" -workers "* ]] && PRPLL_ARGS="-workers $PRPLL_WORKERS $PRPLL_ARGS"
 case "$GIMPS_MODE" in
   prp) WORKPREF="${GIMPS_WORKPREF:-150}" ;;
   tf)  WORKPREF="${GIMPS_WORKPREF:-12}" ;;
@@ -53,9 +90,12 @@ echo $$ > "$DATA_DIR/gimps-start.pid"
 
 ts() { date '+%F %T'; }
 log() { echo "[$(ts)] $*"; }
+plog() { log "$*" | tee -a "$DATA_DIR/logs/progress.log"; }          # видно и в gimps-watch
+notify() { ( gimps-notify "$*" >/dev/null 2>&1 & ) ; }
 
 if ! nvidia-smi -L >/dev/null 2>&1; then
-  log "ОШИБКА: nvidia-smi не видит GPU. Контейнер запущен без --gpus all / без NVIDIA runtime?"; exit 1
+  plog "ОШИБКА: nvidia-smi не видит GPU. Контейнер запущен без --gpus all / без NVIDIA runtime?"
+  notify "ОШИБКА: nvidia-smi не видит GPU — расчёт не запущен"; rm -f "$DATA_DIR/gimps-start.pid"; exit 1
 fi
 if [ -n "${GIMPS_GPUS:-}" ]; then
   IFS=',' read -r -a GPUS <<< "$GIMPS_GPUS"
@@ -63,35 +103,202 @@ else
   mapfile -t GPUS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
 fi
 [ "$GIMPS_USER" = "ANONYMOUS" ] && log "ВНИМАНИЕ: GIMPS_USER не задан — работаю как ANONYMOUS (результаты не попадут в ваш аккаунт)"
-log "Режим: $GIMPS_MODE, workpref=$WORKPREF, пользователь=$GIMPS_USER, GPU: ${GPUS[*]}"
 
-# бесконечный перезапуск команды, пока нет стоп-флага
+# ---------------------------------------------------------------- бэкап: выбор слота / восстановление
+BACKUP_ON=0
+rm -rf "$DATA_DIR/.snap"
+if [ -n "${BACKUP_BUCKET:-}${BACKUP_REMOTE:-}${BACKUP_GDRIVE_TOKEN:-}" ]; then
+  BACKUP_ON=1
+  # С нуля НЕ стартуем, пока не убедились, что хранилище читается (иначе можно бросить задания и затереть бэкап).
+  wait_min="${BACKUP_RESTORE_WAIT_MIN:-30}"; deadline=$(( $(date +%s) + wait_min * 60 )); notified=0
+  while :; do
+    gimps-backup claim; rc=$?
+    [ $rc -eq 0 ] && break
+    case $rc in
+      5) why="хранилище недоступно (сеть, ключи, бакет?) — см. сообщение выше" ;;
+      6) why="все слоты заняты живыми машинами (дождитесь освобождения или задайте другой BACKUP_NAME)" ;;
+      *) why="ошибка gimps-backup claim (код $rc)" ;;
+    esac
+    [ $notified = 0 ] && { notify "Бэкап: $why. Жду до $wait_min мин."; notified=1; }
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      plog "ОШИБКА: $why. Ждал $wait_min мин — не запускаюсь, чтобы не начать задания заново и не затереть бэкап."
+      notify "ОСТАНОВЛЕНО: $why"; rm -f "$DATA_DIR/gimps-start.pid"; exit 1
+    fi
+    plog "Бэкап: $why. Повтор через 60 с (до $wait_min мин)."
+    sleep 60
+  done
+  for d in "$DATA_DIR"/*-gpu*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"; m="${n%-gpu*}"; i="${n##*-gpu}"
+    if [ "$m" != "$GIMPS_MODE" ] || [[ " ${GPUS[*]} " != *" $i "* ]]; then
+      plog "ВНИМАНИЕ: папка $n (из бэкапа) не будет обсчитываться: режим $GIMPS_MODE, GPU ${GPUS[*]}. Нужна машина с тем же числом GPU / тем же GIMPS_MODE."
+    fi
+  done
+  ( gimps-backup loop >>"$DATA_DIR/logs/backup.log" 2>&1 ) 8>&- &
+  log "Внешний бэкап включён: каждые ${BACKUP_INTERVAL_MIN:-30} мин (лог: $DATA_DIR/logs/backup.log)"
+fi
+# остатки блокировок / pid-файлов от прошлого запуска (или из бэкапа) не должны мешать старту
+find "$DATA_DIR" -maxdepth 3 \( -name '*.lck' -o -name '~lock' \) -delete 2>/dev/null
+rm -f "$DATA_DIR"/.pid-*
+log "Режим: $GIMPS_MODE, workpref=$WORKPREF, пользователь=$GIMPS_USER, имя=$GIMPS_NAME, GPU: ${GPUS[*]}"
+
+# ---------------------------------------------------------------- фоновые службы
+# живой журнал + сторожевой таймер (stdout + logs/progress.log; смотреть: gimps-watch).
+# В фоновом режиме его вывод в gimps-start.log не дублируем.
+if [ "${GIMPS_DAEMON:-0}" = "1" ]; then
+  ( while [ ! -f "$STOP_FLAG" ]; do gimps-monitor >/dev/null 2>>"$DATA_DIR/logs/monitor-errors.log"; sleep 5; done ) 8>&- &
+else
+  ( while [ ! -f "$STOP_FLAG" ]; do gimps-monitor; sleep 5; done ) 8>&- &
+fi
+# обрезка логов: файл больше LOG_MAX_MB → оставить последнюю четверть (писатели держат O_APPEND — это безопасно)
+(
+  while [ ! -f "$STOP_FLAG" ]; do
+    for f in "$DATA_DIR"/logs/*.log "$DATA_DIR"/*-gpu*/gpuowl-*.log "$DATA_DIR"/cpu/*.log; do
+      [ -f "$f" ] || continue
+      if [ "$(stat -c %s "$f")" -gt $(( LOG_MAX_MB * 1048576 )) ]; then
+        tail -c $(( LOG_MAX_MB * 262144 )) "$f" > "$f.tmp" && cat "$f.tmp" > "$f" && rm -f "$f.tmp"
+      fi
+    done
+    for _ in $(seq 60); do [ -f "$STOP_FLAG" ] && break; sleep 10; done   # 10 мин, но быстрый выход при остановке
+  done
+) 8>&- &          # служебные циклы не держат блокировку запуска — её держат только gimps-start и воркеры
+
+# пауза, прерываемая остановкой (чтобы gimps-start завершался быстро и сразу освобождал блокировку)
+pause() { local i; for ((i = 0; i < $1; i += 5)); do [ -f "$STOP_FLAG" ] && return; sleep 5; done; }
+
+# ---------------------------------------------------------------- перезапуск воркеров
+# forever <имя> <команда...>: перезапускает команду, пока нет стоп-флага. pid — в $DATA_DIR/.pid-<имя> (для сторожа).
+# Флаг $DATA_DIR/.disabled-<имя> (самотест не прошёл / много ошибок) — воркер не запускается.
+# 5 падений подряд в первые 5 минут работы — воркер выключается (неисправный хост / драйвер).
 forever() {
   local name="$1"; shift
-  local logf="$DATA_DIR/logs/$name.log"
+  local logf="$DATA_DIR/logs/$name.log" fast=0
   while [ ! -f "$STOP_FLAG" ]; do
+    if [ -f "$DATA_DIR/.disabled-$name" ]; then pause 60; continue; fi
     log "старт: $*" >>"$logf"
-    "$@" >>"$logf" 2>&1
-    local rc=$?
+    local t0; t0=$(date +%s)
+    "$@" >>"$logf" 2>&1 &
+    local pid=$!; echo "$pid" > "$DATA_DIR/.pid-$name"
+    wait "$pid"; local rc=$?
+    rm -f "$DATA_DIR/.pid-$name"
     [ -f "$STOP_FLAG" ] && break
+    if [ $rc -ne 0 ] && [ $(( $(date +%s) - t0 )) -lt 300 ]; then fast=$((fast + 1)); else fast=0; fi
+    if [ $fast -ge 5 ]; then
+      echo "5 падений подряд (последний код $rc), см. logs/$name.log" > "$DATA_DIR/.disabled-$name"
+      plog "ОШИБКА: $name падает 5 раз подряд — выключен (файл .disabled-$name). Проверьте logs/$name.log"
+      notify "ВЫКЛЮЧЕН $name: 5 падений подряд (код $rc)"
+      continue
+    fi
     log "$name завершился (rc=$rc), перезапуск через 60 с" >>"$logf"
-    sleep 60
+    pause 60
   done
 }
 
 shutdown() {
   log "Получен сигнал остановки — корректно останавливаю воркеры (сохранение чекпойнтов)"
+  local by_stop=0; [ -f "$STOP_FLAG" ] && by_stop=1     # остановку начал gimps-stop: бэкап он делает сам
   touch "$STOP_FLAG"
-  pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc
-  for _ in $(seq 1 90); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc' >/dev/null || break; sleep 1; done
+  pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
+  for _ in $(seq 1 90); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
   pkill -f '^python3 .*autoprimenet.py -w'
-  rm -f "$DATA_DIR/gimps-start.pid"
+  pkill -f '^python3 .*gimps-monitor'
+  if [ "$BACKUP_ON" = "1" ] && [ $by_stop = 0 ]; then
+    log "Финальный бэкап во внешнее хранилище..."
+    timeout 600 gimps-backup >>"$DATA_DIR/logs/backup.log" 2>&1 && log "бэкап ok" || log "бэкап не удался (см. logs/backup.log)"
+  fi
+  rm -f "$DATA_DIR/gimps-start.pid" "$DATA_DIR"/.pid-*
   wait
   log "Остановлено"
   exit 0
 }
 trap shutdown INT TERM
 
+# ---------------------------------------------------------------- PRPLL: тюнинг и самотест
+# Диапазон экспонент для тюнинга — из полученных заданий (±10%, округлено до 25M, чтобы кэш не сбрасывался
+# из-за каждого нового задания), иначе 110M–200M (first-time PRP).
+tune_range() {
+  local dir="$1" lo hi
+  # строки вида PRP=<AID>,1,2,<экспонента>,-1,77,0 — берём первое число 1M…10^10 после AID
+  read -r lo hi < <(cat "$dir"/worktodo*.txt 2>/dev/null \
+    | awk -F'[=,]' '/^[A-Za-z]+=/ {for(i=3;i<=NF;i++) if ($i ~ /^[0-9]+$/ && length($i) <= 10 && $i+0 > 1000000) {print $i; break}}' \
+    | sort -n | awk 'NR==1{lo=$1} {hi=$1} END{if (NR) {l=int(lo*0.9/25e6)*25; h=int(hi*1.1/25e6+0.999)*25; if (l<1) l=1; printf "%d %d\n", l, h}}')
+  if [ -n "${lo:-}" ]; then echo "exp=${lo}M-${hi}M"; else echo "exp=110M-200M"; fi
+}
+
+# Тюнинг под модель GPU: один раз, кэш (config.txt + tune.txt) на модель + бэкенд + версию PRPLL + диапазон.
+# Неудачный тюнинг повторяется не чаще раза в сутки.
+prpll_tune() {
+  local g="$1" dir="$2" name="$3" mode="${PRPLL_TUNE:-auto}"
+  [ "$mode" = "0" ] && return 0
+  local ver; ver="$(cat /opt/gimps/PRPLL_VERSION 2>/dev/null || echo unknown)"
+  local args="${PRPLL_TUNE_ARGS:-inplace,$(tune_range "$dir")}"
+  local slug; slug="$(echo "$name-$PRPLL_BACKEND-$ver-${args##*exp=}" | tr -c 'A-Za-z0-9.\n-' '_')"
+  local cache="$DATA_DIR/tune-cache/$slug"
+  mkdir -p "$cache"
+  (
+    flock 9                                            # одинаковые GPU тюнятся один раз, остальные ждут
+    if [ "$mode" != "1" ] && [ ! -s "$cache/tune.txt" ] && [ -f "$cache/.failed" ] \
+       && [ $(( $(date +%s) - $(stat -c %Y "$cache/.failed") )) -lt 86400 ]; then
+      log "GPU $g: тюнинг не удавался меньше суток назад — пропускаю (повтор: PRPLL_TUNE=1)"; exit 0
+    fi
+    if [ "$mode" = "1" ] || [ ! -s "$cache/tune.txt" ]; then
+      plog "GPU $g: ТЮНИНГ PRPLL под $name (-tune $args), обычно 20–60 мин; ход — в gimps-watch, лог logs/tune-gpu$g.log"
+      local tdir; tdir="$(mktemp -d "$DATA_DIR/tune-run.XXXX")"
+      ( cd "$tdir" && "$PRPLL_BIN" -d 0 -dir "$tdir" -cache -tune "$args" >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
+      if [ -s "$tdir/tune.txt" ]; then
+        cp "$tdir/tune.txt" "$cache/tune.txt"; [ -f "$tdir/config.txt" ] && cp "$tdir/config.txt" "$cache/config.txt"
+        rm -f "$cache/.failed"
+        plog "GPU $g: тюнинг готов, сохранён в $cache"
+      else
+        touch "$cache/.failed"
+        plog "GPU $g: тюнинг не дал tune.txt (см. logs/tune-gpu$g.log) — работаю с настройками PRPLL по умолчанию"
+      fi
+      rm -rf "$tdir"
+    fi
+  ) 9>"$cache/.lock"
+  if [ -s "$cache/tune.txt" ]; then
+    cp "$cache/tune.txt" "$dir/tune.txt"
+    [ -f "$cache/config.txt" ] && cp "$cache/config.txt" "$dir/config.txt"
+  fi
+  return 0
+}
+
+# Самотест GPU: PRP-тест известного простого M1257787 (секунды–минуты) в отдельной папке — результат
+# никуда не отправляется. Не прошёл → воркер этой GPU выключен (.disabled-prp-gpuN) и приходит уведомление.
+gpu_selftest() {
+  local g="$1" name="$2"
+  [ "${GPU_SELFTEST:-1}" = "1" ] || return 0
+  local ok="$DATA_DIR/.selftest-ok-gpu$g"
+  if [ -f "$ok" ] && [ $(( $(date +%s) - $(stat -c %Y "$ok") )) -lt 86400 ]; then return 0; fi
+  local t; t="$(mktemp -d "$DATA_DIR/tune-run.st.XXXX")"
+  plog "GPU $g: самотест PRPLL (M1257787 — известное простое)…"
+  ( cd "$t" && timeout 1200 "$PRPLL_BIN" -d 0 -dir "$t" -prp 1257787 -proof 0 >>"$DATA_DIR/logs/selftest-gpu$g.log" 2>&1 )
+  if grep -qE '"status" *: *"P"' "$t"/results*.txt 2>/dev/null; then
+    touch "$ok"; rm -rf "$t"; plog "GPU $g: самотест пройден"; return 0
+  fi
+  rm -rf "$t"
+  echo "самотест PRPLL не пройден $(ts) — см. logs/selftest-gpu$g.log" > "$DATA_DIR/.disabled-prp-gpu$g"
+  plog "ОШИБКА: GPU $g ($name) не прошла самотест — воркер выключен. Хост/драйвер неисправен? См. logs/selftest-gpu$g.log"
+  notify "GPU $g ($name) НЕ прошла самотест PRPLL — воркер выключен, смените машину"
+  return 1
+}
+
+# Запрет на новые задания (gimps-stop --finish → QuitGIMPS в prime.ini) снимается автоматически только
+# на машине, которая продолжила чужой слот из бэкапа; GIMPS_NO_NEW_WORK=1/0 — явно включить/снять.
+apn_work_policy() {
+  local dir="$1"
+  [ -f "$dir/prime.ini" ] || return 0
+  local quit=0; grep -Eiq '^QuitGIMPS *= *(1|true)' "$dir/prime.ini" && quit=1
+  if [ "${GIMPS_NO_NEW_WORK:-}" = "1" ] && [ $quit = 0 ]; then
+    $APN -w "$dir" --no-more-work >/dev/null 2>&1; log "$(basename "$dir"): новые задания не берутся (GIMPS_NO_NEW_WORK=1)"
+  elif [ $quit = 1 ] && { [ "${GIMPS_NO_NEW_WORK:-}" = "0" ] || [ -f "$DATA_DIR/.restored-from-backup" ]; }; then
+    $APN -w "$dir" --resume-work >/dev/null 2>&1; log "$(basename "$dir"): запрет на новые задания снят"
+  elif [ $quit = 1 ]; then
+    log "$(basename "$dir"): новые задания не берутся (было gimps-stop --finish; снять: GIMPS_NO_NEW_WORK=0)"
+  fi
+}
+
+# ---------------------------------------------------------------- GPU-воркеры
 for g in "${GPUS[@]}"; do
   g="$(echo "$g" | tr -d ' ')"
   dir="$DATA_DIR/${GIMPS_MODE}-gpu${g}"
@@ -104,27 +311,39 @@ for g in "${GPUS[@]}"; do
   apn_common=(-w "$dir" -u "$GIMPS_USER" -T "$WORKPREF" -H "$cname" -W "$GIMPS_DAYS_WORK"
               --processor-model "$gpu_name" --no-version-check --no-color)
   if [ "$GIMPS_MODE" = "prp" ]; then
-    apn_args=(--prpll "${apn_common[@]}" --max-disk-space "$PROOF_DISK_GB")
+    apn_args=(--prpll "${apn_common[@]}" --max-disk-space "$PROOF_DISK_GB" --num-workers "$PRPLL_WORKERS")
   else
     apn_args=(--mfaktc "${apn_common[@]}")
     [ -f "$dir/mfaktc.ini" ] || cp /opt/gimps/share/mfaktc.ini "$dir/mfaktc.ini"
   fi
+  apn_work_policy "$dir"
   # shellcheck disable=SC2086
   ( forever "apn-gpu$g" $APN "${apn_args[@]}" ${APN_ARGS:-} ) &
 
   sleep 20   # даём AutoPrimeNet зарегистрироваться и получить первое задание
 
   if [ "$GIMPS_MODE" = "prp" ]; then
-    if [ "${PRPLL_TUNE:-0}" = "1" ] && [ ! -f "$dir/tune.txt" ]; then
-      log "GPU $g: prpll -tune (может занять 30–90 минут)..."
-      ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && "$PRPLL_BIN" -d 0 -dir "$dir" -tune >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
-    fi
     # shellcheck disable=SC2086
-    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "prp-gpu$g" "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
+    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && prpll_tune "$g" "$dir" "$gpu_name" \
+        && gpu_selftest "$g" "$gpu_name" \
+        && forever "prp-gpu$g" "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
   else
+    # mfaktc при каждом запуске сам прогоняет короткий самотест и не стартует, если он не прошёл
     ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "tf-gpu$g" mfaktc -d 0 ) &
   fi
 done
+rm -f "$DATA_DIR/.restored-from-backup"
 
-log "Запущено. Логи: $DATA_DIR/logs/  Статус: gimps-status"
+# ---------------------------------------------------------------- CPU: mprime (Prime95) параллельно с GPU
+if [ "${CPU_WORK:-auto}" != "0" ] && [ -x /opt/gimps/mprime/mprime ]; then
+  if gimps-cpu-setup; then
+    log "CPU: mprime, тип работы ${CPU_WORKPREF:-4}, низкий приоритет (nice 19) — GPU-воркеры не замедляются"
+    ( cd "$DATA_DIR/cpu" && forever "cpu" nice -n 19 unbuffer ./mprime -d ) &
+  else
+    plog "CPU: mprime не настроен автоматически — CPU не используется (см. $DATA_DIR/cpu/setup.log)"
+  fi
+fi
+
+log "Запущено. Живой журнал: gimps-watch   Статус: gimps-status   Логи: $DATA_DIR/logs/"
+notify "Запущено: режим $GIMPS_MODE, GPU: ${GPUS[*]}$([ "$BACKUP_ON" = 1 ] && echo ", бэкап: слот $(cat "$DATA_DIR/.backup-slot" 2>/dev/null || echo 1)")"
 wait

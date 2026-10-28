@@ -2,10 +2,11 @@
 # Остановка GIMPS.
 #   gimps-stop              — корректно остановить воркеры (чекпойнт), отправить результаты. Задания остаются за вами.
 #   gimps-stop --finish     — НЕ брать новые задания; текущие досчитать (воркеры продолжают работать)
-#   gimps-stop --unreserve  — остановить и ВЕРНУТЬ все незавершённые задания в PrimeNet
+#   gimps-stop --unreserve  — остановить, ВЕРНУТЬ все незавершённые задания GPU в PrimeNet и убрать их из бэкапа
 #                             (делайте это перед удалением VM, если не будете продолжать!)
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
+[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
 APN="python3 $(command -v autoprimenet.py)"
 dirs=( "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu* )
 
@@ -14,17 +15,29 @@ each_dir() { for d in "${dirs[@]}"; do [ -f "$d/prime.ini" ] && { echo "== $d"; 
 if [ "${1:-}" = "--finish" ]; then
   pkill -f '^python3 .*autoprimenet.py -w'; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
   each_dir --no-more-work
-  echo "Новые задания больше не берутся. Когда gimps-status покажет пустую очередь — можно останавливать."
+  echo "GPU: новые задания больше не берутся. Когда gimps-status покажет пустую очередь — можно останавливать."
+  echo "     Запрет сохраняется при перезапуске этой машины; на машине, продолжившей слот из бэкапа, снимается сам."
+  echo "     Снять вручную: GIMPS_NO_NEW_WORK=0 при следующем gimps-start."
+  [ -d "$DATA_DIR/cpu" ] && echo "CPU (mprime): задание P-1 длится часы; чтобы не брать новые — cd $DATA_DIR/cpu && ./mprime -m → Test/PrimeNet."
   exit 0
 fi
 
 touch "$DATA_DIR/.stop"
-pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc
+pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
 echo "Жду сохранения чекпойнтов..."
-for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc' >/dev/null || break; sleep 1; done
+for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
 pkill -f '^python3 .*autoprimenet.py -w' ; sleep 2
 echo "Отправляю результаты и proof-файлы..."
 each_dir --upload-proofs
-[ "${1:-}" = "--unreserve" ] && { echo "Возвращаю задания в PrimeNet..."; each_dir --unreserve-all; }
+backup_on=0
+{ [ -n "${BACKUP_BUCKET:-}${BACKUP_REMOTE:-}${BACKUP_GDRIVE_TOKEN:-}" ] || grep -qs '^BACKUP_' "$DATA_DIR/gimps.env"; } && backup_on=1
+if [ "${1:-}" = "--unreserve" ]; then
+  echo "Возвращаю задания GPU в PrimeNet..."; each_dir --unreserve-all
+  [ -d "$DATA_DIR/cpu" ] && echo "CPU (mprime): незавершённое задание верните вручную: cd $DATA_DIR/cpu && ./mprime -m → Advanced → Unreserve exponent"
+  # задания возвращены — их чекпойнты в бэкапе больше не нужны и не должны продолжиться на другой машине
+  [ $backup_on = 1 ] && { echo "Убираю GPU-задания из слота бэкапа..."; gimps-backup release; }
+elif [ $backup_on = 1 ]; then
+  echo "Финальный бэкап во внешнее хранилище..."; gimps-backup
+fi
 [ -f "$DATA_DIR/gimps-start.pid" ] && kill "$(cat "$DATA_DIR/gimps-start.pid")" 2>/dev/null; rm -f "$DATA_DIR/gimps-start.pid"
 echo "Готово."

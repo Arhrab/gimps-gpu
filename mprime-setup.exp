@@ -1,0 +1,58 @@
+#!/usr/bin/expect -f
+# Первичная настройка mprime без вопросов (на основе mprime.exp из
+# github.com/tdulcet/Distributed-Computing-Scripts, MIT License, © Teal Dulcet).
+# Запуск: expect mprime-setup.exp <User ID> <Computer name> <Type of work> <CPU cores> <Stage 2 memory GiB>
+
+set timeout 600
+set USERID   [lindex $argv 0]
+set COMPUTER [lindex $argv 1]
+set TYPE     [lindex $argv 2]
+set CORES    [lindex $argv 3]
+set MEM      [lindex $argv 4]
+
+spawn ./mprime -m
+expect "Join Gimps? (*):"
+sleep 1; send -- "y\r"
+expect "Use PrimeNet to get work and report results (*):"
+sleep 1; send -- "y\r"
+expect "Your user ID or \"ANONYMOUS\" (*):"
+sleep 1; send -- "$USERID\r"
+expect "Optional computer name:"
+sleep 1; send -- "$COMPUTER\r"
+expect {
+	"Type of work to get (*):"            { sleep 1; send -- "$TYPE\r"; exp_continue }
+	"stage 2 memory in GiB (*):"          { sleep 1; send -- "$MEM\r"; exp_continue }
+	"*umber of workers*(*):"              { sleep 1; send -- "1\r"; exp_continue }
+	"*ores to use*(*):"                   { sleep 1; send -- "$CORES\r"; exp_continue }
+	"*ores per test*(*):"                 { sleep 1; send -- "$CORES\r"; exp_continue }
+	"Upload bandwidth limit in Mbps (*):" { sleep 1; send -- "10000\r"; exp_continue }
+	"Skip advanced resource settings (*):" { sleep 1; send -- "n\r"; exp_continue }
+	"Optional directory to hold *:"       { sleep 1; send -- "\r"; exp_continue }
+	"Your choice:" { }
+	"Use the following values to select a work type:" { exp_continue }
+	"*: 1" { exp_continue }
+	" (*):" { sleep 1; send -- "\r"; exp_continue }
+	timeout { send \x03; sleep 5; send -- "5\r"; expect eof; exit 2 }
+}
+expect {
+	"Done communicating with server." { }
+	timeout { }
+}
+send \x03
+sleep 10
+expect "Choose Test/Continue to restart."
+sleep 1
+send -- "15\r"
+expect {
+	"Days between sending end dates (*):" { sleep 1; send -- "0.25\r"; exp_continue }
+	"Your choice:" { }
+	" (*):" { sleep 1; send -- "\r"; exp_continue }
+	timeout { }
+}
+expect {
+	"Done communicating with server." { }
+	timeout { }
+}
+sleep 1
+send -- "5\r"
+expect eof

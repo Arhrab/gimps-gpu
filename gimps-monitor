@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""gimps-monitor — единый построчный журнал прогресса всех задач GIMPS на машине.
+
+Читает логи воркеров ($DATA_DIR/logs/tf-gpuN.log, prp-gpuN.log, cpu.log, apn-gpuN.log),
+пишет понятные строки в stdout и в $DATA_DIR/logs/progress.log:
+  * НОВАЯ ЗАДАЧА — что считается, оценка в GHz-days, сколько займёт, полный снимок GPU/CPU;
+  * прогресс на каждом новом 1% — процент, осталось, скорость (GHz-d/day), кратко GPU;
+  * результат задачи и засчитанный PrimeNet кредит;
+  * ход тюнинга PRPLL, ошибки бэкапа.
+Заодно — сторож: перезапускает воркер, чей лог молчит дольше WATCHDOG_MIN минут, и выключает PRP-воркер,
+если ошибок Gerbicz (EE) больше EE_MAX_PER_HOUR за час. Важное дублирует в Telegram/вебхук (gimps-notify).
+Запускается из gimps-start (один экземпляр); смотреть: gimps-watch.
+"""
+import fcntl, glob, json, os, re, signal, subprocess, sys, time
+
+DATA = os.environ.get("DATA_DIR", "/data")
+LOGS = os.path.join(DATA, "logs")
+OUT = os.path.join(LOGS, "progress.log")
+HIST = os.path.join(DATA, ".credit-history.json")
+COLOR = os.environ.get("NO_COLOR") is None
+POLL = 2.0
+WATCHDOG_MIN = float(os.environ.get("WATCHDOG_MIN", "20") or 0)
+EE_MAX = int(os.environ.get("EE_MAX_PER_HOUR", "3") or 3)
+NOTIFY_ALL = os.environ.get("NOTIFY_LEVEL", "important") == "all"
+
+_last_notify = {}
+def notify(text, key=None, every=0):
+    """Уведомление через gimps-notify (в фоне). key/every — не чаще раза в every секунд."""
+    if key:
+        if time.time() - _last_notify.get(key, 0) < every:
+            return
+        _last_notify[key] = time.time()
+    try:
+        subprocess.Popen(["gimps-notify", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+B, G, Y, R, CY, DIM = "1", "32", "33", "31", "36", "2"
+
+# ---------------------------------------------------------------- вывод
+_out = None
+def emit(text):
+    global _out
+    if _out is None:
+        os.makedirs(LOGS, exist_ok=True)
+        _out = open(OUT, "a", encoding="utf-8", buffering=1)
+    for line in text.splitlines():
+        print(line, flush=True)
+        _out.write(line + "\n")
+
+def now():
+    return time.strftime("%m-%d %H:%M:%S")
+
+def fmt_dur(sec):
+    if sec is None or sec < 0:
+        return "?"
+    sec = int(sec)
+    d, h, m = sec // 86400, sec // 3600 % 24, sec // 60 % 60
+    if d:
+        return f"{d}д {h}ч {m:02d}м"
+    if h:
+        return f"{h}ч {m:02d}м"
+    return f"{m}м {sec % 60:02d}с"
+
+def parse_dur(s):
+    """'44m03s' / '1h05m' / '2d 03:04' / '05:12' / '1d 2h' -> секунды"""
+    s = s.strip()
+    m = re.match(r"(?:(\d+)d\s*)?(\d+):(\d+)$", s)
+    if m:
+        return int(m.group(1) or 0) * 86400 + int(m.group(2)) * 3600 + int(m.group(3)) * 60
+    tot, found = 0, False
+    for v, u in re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", s):
+        tot += float(v) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[u]; found = True
+    return tot if found else None
+
+# ---------------------------------------------------------------- GPU / CPU
+_THR = [(0x4, "лимит мощности"), (0x8, "HW slowdown"), (0x20, "перегрев(SW)"),
+        (0x40, "перегрев(HW)"), (0x80, "power brake"), (0x2, "app clocks")]
+_gcache = {}
+def gpu(idx):
+    t = time.time()
+    if idx in _gcache and t - _gcache[idx][0] < 3:
+        return _gcache[idx][1]
+    q = ("name,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit,"
+         "clocks.sm,clocks.max.sm,clocks.mem,memory.used,memory.total,fan.speed,pstate,"
+         "clocks_event_reasons.active,compute_cap")
+    try:
+        r = subprocess.run(["nvidia-smi", "-i", str(idx), f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10).stdout.strip().split(", ")
+        keys = q.split(",")
+        d = dict(zip(keys, r)) if len(r) >= len(keys) - 1 else {}
+    except Exception:
+        d = {}
+    _gcache[idx] = (t, d)
+    return d
+
+def _num(v, fmt="{:.0f}"):
+    try:
+        return fmt.format(float(v))
+    except Exception:
+        return "?"
+
+def gpu_full(idx):
+    d = gpu(idx)
+    if not d:
+        return f"GPU{idx}: nvidia-smi недоступен"
+    try:
+        reasons = int(d.get("clocks_event_reasons.active", "0"), 16)
+    except ValueError:
+        reasons = 0
+    thr = ", ".join(n for b, n in _THR if reasons & b) or "нет"
+    fan = d.get("fan.speed", "")
+    fan = f"{_num(fan)}%" if fan and "N/A" not in fan else "н/д"
+    return (f"GPU{idx} {d.get('name','?')} (CC {d.get('compute_cap','?')}): загрузка {_num(d.get('utilization.gpu'))}%, "
+            f"память-шина {_num(d.get('utilization.memory'))}% | {_num(d.get('temperature.gpu'))}°C, вентилятор {fan} | "
+            f"{_num(d.get('power.draw'), '{:.0f}')}/{_num(d.get('power.limit'))} Вт | ядро {_num(d.get('clocks.sm'))}"
+            f"/{_num(d.get('clocks.max.sm'))} МГц, память {_num(d.get('clocks.mem'))} МГц | "
+            f"VRAM {_num(d.get('memory.used'))}/{_num(d.get('memory.total'))} МБ | {d.get('pstate','?')} | "
+            f"ограничения частоты: {thr}")
+
+def gpu_short(idx):
+    d = gpu(idx)
+    if not d:
+        return ""
+    return (f"{_num(d.get('utilization.gpu'))}% {_num(d.get('temperature.gpu'))}°C "
+            f"{_num(d.get('power.draw'))}W {_num(d.get('clocks.sm'))}/{_num(d.get('clocks.mem'))}МГц")
+
+_cpu_prev = None
+def cpu_load():
+    global _cpu_prev
+    try:
+        v = list(map(int, open("/proc/stat").readline().split()[1:]))
+        idle, tot = v[3] + v[4], sum(v)
+        if _cpu_prev:
+            di, dt = idle - _cpu_prev[0], tot - _cpu_prev[1]
+            _cpu_prev = (idle, tot)
+            return 100.0 * (1 - di / dt) if dt else None
+        _cpu_prev = (idle, tot)
+    except Exception:
+        pass
+    return None
+
+def cpu_temp():
+    for f in glob.glob("/sys/class/hwmon/hwmon*/temp1_input"):
+        try:
+            name = open(os.path.join(os.path.dirname(f), "name")).read().strip()
+            if name in ("k10temp", "coretemp", "zenpower", "cpu_thermal"):
+                return int(open(f).read()) / 1000
+        except Exception:
+            pass
+    return None
+
+def cpu_full():
+    try:
+        model = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
+    except Exception:
+        model = "?"
+    ld = cpu_load()
+    t = cpu_temp()
+    return (f"CPU {model}, потоков {os.cpu_count()} | загрузка {('%.0f%%' % ld) if ld is not None else '?'} | "
+            f"load avg {os.getloadavg()[0]:.1f} | температура {('%.0f°C' % t) if t else 'н/д'}")
+
+def cpu_short():
+    ld = cpu_load(); t = cpu_temp()
+    return f"CPU {('%.0f%%' % ld) if ld is not None else '?'}" + (f" {t:.0f}°C" if t else "")
+
+# ---------------------------------------------------------------- кредит (GHz-days)
+def tf_ghd(exp, bmin, bmax):
+    g, b = 0.0, bmin + 1
+    while b <= bmax:
+        g += (0.011160 if b <= 62 else 0.017832 if b <= 64 else 0.016968) * 2.0 ** (b - 48); b += 1
+    return g * 1680.0 / exp
+
+def hist_load():
+    try:
+        return json.load(open(HIST))
+    except Exception:
+        return []
+
+def hist_add(kind, exp, ghd):
+    h = [x for x in hist_load() if not (x["kind"] == kind and x["exp"] == exp)]
+    h.append({"kind": kind, "exp": exp, "ghd": ghd})
+    try:
+        json.dump(h[-200:], open(HIST, "w"))
+    except Exception:
+        pass
+
+def ghd_estimate(kind, exp):
+    """Оценка кредита по прошлым результатам того же типа: работа PRP/LL растёт ~ E^2.1."""
+    h = [x for x in hist_load() if x["kind"] == kind and x["ghd"] > 0]
+    if not h or not exp:
+        return None
+    ref = min(h, key=lambda x: abs(x["exp"] - exp))
+    return ref["ghd"] * (exp / ref["exp"]) ** (2.1 if kind in ("PRP", "LL") else 1.0)
+
+# ---------------------------------------------------------------- воркеры
+class Worker:
+    def __init__(self, kind, idx):
+        self.kind, self.idx = kind, idx          # kind: TF | PRP | CPU
+        self.label = f"GPU{idx} {kind}" if kind != "CPU" else "CPU"
+        self.reset()
+
+    def reset(self):
+        self.task = None; self.exp = None; self.ghd = None; self.ghd_est = False
+        self.started = None; self.announced = False; self.last_int = -1
+        self.extra = ""; self.fft = None; self.proof = None; self.errors = 0
+        self.first_pct = None; self.first_t = None; self.subtype = ""
+
+    def tag(self):
+        return c(CY, f"[{self.label}]")
+
+    def snap_full(self):
+        return gpu_full(self.idx) if self.kind != "CPU" else cpu_full()
+
+    def snap_short(self):
+        return gpu_short(self.idx) if self.kind != "CPU" else cpu_short()
+
+    def announce(self, eta_sec, speed_txt=""):
+        self.announced = True
+        ghd = "н/д (появится после первого результата этого типа)" if self.ghd is None else \
+              (f"≈{self.ghd:.1f} GHz-d (оценка)" if self.ghd_est else f"{self.ghd:.2f} GHz-d")
+        emit(c(B, f"━━ {now()} {self.label}: НОВАЯ ЗАДАЧА ━━ {self.task}"))
+        extra = self.extra if self.extra and self.extra not in speed_txt else ""
+        emit(f"   оценка: {ghd} | займёт ≈ {fmt_dur(eta_sec) if eta_sec is not None else 'уточнится после первых %'}" + (f" | {speed_txt.strip()}" if speed_txt else "")
+             + (f" | {extra}" if extra else ""))
+        emit(c(DIM, "   " + self.snap_full()))
+
+    def progress(self, pct, eta_sec, speed_txt, silent):
+        ip = int(pct)
+        if not self.announced:
+            if silent:
+                self.announced = True; self.last_int = ip; return
+            self.announce(eta_sec, speed_txt)
+            self.last_int = ip
+        if ip != self.last_int and not silent:
+            self.last_int = ip
+            emit(f"{now()} {self.tag()} {self.short_task()} {c(B, f'{pct:6.2f}%')} | осталось {fmt_dur(eta_sec):>10} | "
+                 f"{speed_txt} | {self.snap_short()}")
+        self.last_int = ip
+
+    def short_task(self):
+        return f"M{self.exp}" if self.exp else (self.task or "?")
+
+    def done(self, text, good=False, bad=False, silent=False):
+        if silent:
+            self.reset(); return
+        el = f" за {fmt_dur(time.time() - self.started)}" if self.started else ""
+        col = Y if good else (R if bad else G)
+        emit(c(col, f"✔ {now()} {self.label}: {text}{el}"))
+        if good or bad or NOTIFY_ALL:
+            notify(f"{self.label}: {text}{el}")
+        self.reset()
+
+# ---------------------------------------------------------------- парсеры
+RE_TF_START = re.compile(r"Starting trial factoring M(\d+) from 2\^(\d+) to 2\^(\d+) \(([\d.]+) GHz-days\)")
+RE_TF_PROG = re.compile(r"^\s*\w{3}\s+\d+\s+[\d:]+\s*\|\s*(\d+)\s+([\d.]+)%\s*\|\s*([\d.]+)\s+(\S+)\s*\|\s*([\d.]+)")
+RE_TF_NOF = re.compile(r"no factor for M(\d+) from 2\^(\d+) to 2\^(\d+)")
+RE_TF_FAC = re.compile(r"M(\d+) has a factor: (\d+)")
+RE_PRP_PROG = re.compile(r"^\d{8} [\d:]{8} (\d+) (OK|EE)\s+(\d+) ([0-9a-f]{16})\s+([\d.]+) ETA ([^;]+);")
+RE_PRP_FFT = re.compile(r"^\d{8} [\d:]{8} (\d+) FFT: (\S+) (\S+) \(([\d.]+) bpw\)")
+RE_PRP_PROOF = re.compile(r"Proof of power (\d+) requires about ([\d.]+)GB")
+RE_CREDIT = re.compile(r"Credit for exponent (\d+): ([\d.]+) GHz-days")
+RE_MP_PCT = re.compile(r"(\d+(?:\.\d+)?)% complete|\[(\d+(?:\.\d+)?)%\]")
+RE_MP_EXP = re.compile(r"\bM(\d{5,10})\b")
+RE_MP_CREDIT = re.compile(r"CPU credit is ([\d.]+) GHz-days")
+
+def worktodo_tf(idx):
+    try:
+        for l in open(os.path.join(DATA, f"tf-gpu{idx}", "worktodo.txt")):
+            p = l.strip().split("=", 1)[-1].split(",")
+            if len(p) >= 4 and p[1].isdigit():
+                return int(p[1]), int(p[2]), int(p[3])
+    except Exception:
+        pass
+    return None
+
+def handle_tf(w, line, silent):
+    m = RE_TF_START.search(line)
+    if m:
+        w.reset()
+        w.exp, b1, b2, w.ghd = int(m[1]), int(m[2]), int(m[3]), float(m[4])
+        w.task = f"TF M{w.exp}: поиск делителей 2^{b1}→2^{b2}"
+        w.started = time.time(); return
+    m = RE_TF_PROG.search(line)
+    if m:
+        pct, eta, gdd = float(m[2]), parse_dur(m[4]), float(m[5])
+        if not w.task:                                   # монитор запущен посреди задачи
+            wt = worktodo_tf(w.idx)
+            if wt:
+                w.exp = wt[0]; w.ghd = tf_ghd(*wt)
+                w.task = f"TF M{wt[0]}: поиск делителей 2^{wt[1]}→2^{wt[2]} (продолжение)"
+            else:
+                w.task = "TF (продолжение)"
+            w.started = time.time()
+        w.progress(pct, eta, f"{gdd:7.1f} GHz-d/day", silent); return
+    m = RE_TF_FAC.search(line)
+    if m:
+        if not silent:
+            emit(c(Y, f"★★★ {now()} {w.label}: НАЙДЕН ДЕЛИТЕЛЬ M{m[1]}: {m[2]} ★★★"))
+            notify(f"★ НАЙДЕН ДЕЛИТЕЛЬ M{m[1]}: {m[2]} ({w.label})")
+        return
+    m = RE_TF_NOF.search(line)
+    if m:
+        g = f", {w.ghd:.2f} GHz-d" if w.ghd else ""
+        w.done(f"M{m[1]}: делителей в 2^{m[2]}–2^{m[3]} нет{g}", silent=silent); return
+    if "found" in line and "factor" in line and " for M" in line:
+        w.done(line.strip(), good=True, silent=silent)
+
+def handle_prp(w, line, silent):
+    m = RE_PRP_FFT.search(line)
+    if m:
+        if w.exp != int(m[1]):
+            w.reset(); w.exp = int(m[1]); w.started = time.time()
+        w.fft = f"FFT {m[2]} {m[3]} ({m[4]} bpw)"; return
+    m = RE_PRP_PROOF.search(line)
+    if m:
+        w.proof = f"proof power {m[1]} (~{m[2]} ГБ на диске)"; return
+    if "Proof generation disabled" in line:
+        w.proof = "без proof"; return
+    m = RE_PRP_PROG.search(line)
+    if m:
+        exp, ok, k, us, eta = int(m[1]), m[2], int(m[3]), float(m[5]), parse_dur(m[6])
+        if us <= 0 or k == 0:                              # строка загрузки чекпойнта, без скорости
+            return
+        if w.exp != exp or not w.task:
+            if w.exp != exp:
+                w.reset(); w.exp = exp; w.started = time.time()
+            w.task = f"PRP-тест M{exp} ({int(exp * 0.30103) + 1:,} цифр)".replace(",", " ")
+            est = ghd_estimate("PRP", exp)
+            w.ghd, w.ghd_est = est, est is not None
+            w.extra = " | ".join(x for x in (w.fft, w.proof) if x)
+        if ok == "EE":
+            w.errors += 1
+            if not silent:
+                emit(c(R, f"{now()} {w.label}: ошибка проверки Gerbicz на итерации {k} (PRPLL откатится к чекпойнту)"))
+                ee_event(w.idx)
+        total_days = exp * us / 1e6 / 86400
+        speed = f"{us:6.1f} мкс/ит, {1e6/us:,.0f} ит/с".replace(",", " ")
+        if w.ghd:
+            speed += f", ≈{w.ghd / total_days:,.0f} GHz-d/day".replace(",", " ")
+        w.progress(100.0 * k / exp, eta, speed, silent); return
+    if '"worktype"' in line and '"status"' in line:
+        try:
+            r = json.loads(line[line.index("{"):])
+        except Exception:
+            r = {}
+        e = r.get("exponent", w.exp)
+        if r.get("status") == "P":
+            if not silent:
+                emit(c(Y, f"★★★★★ {now()} {w.label}: M{e} — ВЕРОЯТНО ПРОСТОЕ! Срочно проверьте results и почту! ★★★★★"))
+                notify(f"★★★★★ M{e} — ВЕРОЯТНО ПРОСТОЕ! ({w.label}) Проверьте results и mersenne.org")
+            w.done(f"M{e}: PROBABLE PRIME", good=True, silent=silent)
+        else:
+            w.done(f"M{e}: составное (res64 {r.get('res64','?')}), {r.get('worktype','PRP')}"
+                   + (f", ошибок {w.errors}" if w.errors else ""), silent=silent)
+
+def handle_cpu(w, line, silent):
+    m = RE_MP_CREDIT.search(line)
+    if m:
+        g = float(m[1])
+        if w.exp:
+            hist_add(w.subtype or "CPU", w.exp, g)
+        if not silent:
+            emit(c(G, f"   {now()} CPU: PrimeNet засчитал {g:.3f} GHz-d"))
+        return
+    if any(s in line for s in ("is not prime", "completed P-1", "found a factor", "has a factor", "is a probable prime",
+                               "completed ECM", "Mersenne number is prime")):
+        good = "factor" in line or "prime!" in line.lower() or "probable prime" in line
+        w.done(re.sub(r"^\[.*?\]\s*", "", line.strip()), good=good, silent=silent); return
+    me = RE_MP_EXP.search(line); mp = RE_MP_PCT.search(line)
+    if me and ("Starting" in line or "P-1 on" in line or "PRP test of" in line or "ECM on" in line
+               or (mp and w.exp and int(me[1]) != w.exp)):
+        if w.exp != int(me[1]):
+            w.reset(); w.exp = int(me[1]); w.started = time.time()
+        sub = "P-1" if "P-1" in line else "PRP" if "PRP" in line else "ECM" if "ECM" in line else w.subtype or "CPU"
+        w.subtype = sub
+        w.task = f"{sub} M{w.exp} на CPU (mprime)"
+        est = ghd_estimate(sub, w.exp)
+        w.ghd, w.ghd_est = est, est is not None
+    if mp and w.exp:
+        pct = float(mp[1] or mp[2])
+        stg = re.search(r"[Ss]tage (\d)", line)
+        if stg:
+            w.extra = f"stage {stg[1]}"
+        eta = None
+        me2 = re.search(r"ETA:?\s*([0-9dhms: ]+)", line)
+        if me2:
+            eta = parse_dur(me2[1])
+        if eta is None:                                   # считаем по скорости
+            t = time.time()
+            if w.first_pct is None or pct < w.first_pct:
+                w.first_pct, w.first_t = pct, t
+            elif pct > w.first_pct and t - w.first_t >= 20:
+                eta = (100 - pct) * (t - w.first_t) / (pct - w.first_pct)
+        speed = f"mprime{', ' + w.extra if w.extra else ''}"
+        if not w.task:
+            w.task = f"M{w.exp} на CPU (mprime)"
+        w.progress(pct, eta, speed, silent)
+
+
+# ---------------------------------------------------------------- сторож и аварийное выключение
+def read_pid(name):
+    try:
+        return int(open(os.path.join(DATA, f".pid-{name}")).read().strip())
+    except Exception:
+        return None
+
+def alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except Exception:
+        return False
+
+def stop_worker(name, sig=signal.SIGTERM):
+    if name == "cpu":
+        subprocess.run(["pkill", "-INT", "-x", "mprime"], check=False)
+        return
+    pid = read_pid(name)
+    if pid and alive(pid):
+        try:
+            os.kill(pid, sig)
+        except Exception:
+            pass
+
+def disable(name, why):
+    try:
+        open(os.path.join(DATA, f".disabled-{name}"), "w").write(f"{time.strftime('%F %T')} {why}\n")
+    except Exception:
+        pass
+    stop_worker(name)
+    emit(c(R, f"✖ {now()} {name}: ВЫКЛЮЧЕН — {why}. Вернуть: rm {DATA}/.disabled-{name} (воркер стартует сам)"))
+    notify(f"ВЫКЛЮЧЕН {name}: {why}")
+
+_ee = {}
+def ee_event(idx):
+    t = time.time()
+    lst = [x for x in _ee.get(idx, []) if t - x < 3600] + [t]
+    _ee[idx] = lst
+    if len(lst) > EE_MAX:
+        disable(f"prp-gpu{idx}", f"{len(lst)} ошибок Gerbicz за час — вероятно, неисправна GPU/память")
+        _ee[idx] = []
+
+_wd_restarts = {}
+def watchdog():
+    if WATCHDOG_MIN <= 0:
+        return
+    t = time.time(); limit = WATCHDOG_MIN * 60
+    for pf in glob.glob(os.path.join(DATA, ".pid-*")):
+        name = os.path.basename(pf)[5:]
+        if not re.match(r"(tf|prp)-gpu\d+$|cpu$", name):
+            continue
+        pid = read_pid(name)
+        if not pid or not alive(pid):
+            continue
+        try:
+            started = os.path.getmtime(pf)
+            last = os.path.getmtime(os.path.join(LOGS, f"{name}.log"))
+        except OSError:
+            continue
+        if t - started < limit or t - last < limit:
+            continue
+        rs = [x for x in _wd_restarts.get(name, []) if t - x < 3 * 3600] + [t]
+        _wd_restarts[name] = rs
+        if len(rs) > 3:
+            disable(name, f"завис {len(rs)} раза за 3 часа")
+            continue
+        emit(c(R, f"⟳ {now()} {name}: лог молчит {fmt_dur(t - last)} — перезапускаю (сторож, WATCHDOG_MIN={WATCHDOG_MIN:g})"))
+        notify(f"{name}: завис ({fmt_dur(t - last)} без вывода) — перезапускаю")
+        stop_worker(name)
+        os.utime(pf, None)                     # следующая проверка — не раньше, чем через WATCHDOG_MIN
+
+# ---------------------------------------------------------------- тюнинг и бэкап в журнале
+_tune = {}
+def handle_tune(idx, line, silent):
+    line = line.strip()
+    if not line or silent:
+        return
+    st = _tune.setdefault(idx, {"t0": time.time(), "last_emit": 0})
+    t = time.time()
+    if t - st["last_emit"] >= 300:
+        st["last_emit"] = t
+        emit(c(DIM, f"{now()} [GPU{idx} TUNE] идёт тюнинг PRPLL ({fmt_dur(t - st['t0'])}): {line[:140]}"))
+
+RE_BK_BAD = re.compile(r"ОТКАЗ|ошибка|недоступно|не удалось|ДРУГАЯ")
+def handle_backup(line, silent):
+    m = re.search(r"backup\[([^\]]*)\]:\s*(.*)", line)
+    if silent or not m:
+        return
+    msg = f"{m[1]}: {m[2]}"
+    if RE_BK_BAD.search(line):
+        emit(c(R, f"{now()} [BACKUP] слот {msg}"))
+        notify(f"Бэкап: {msg}", key="backup", every=3600)
+    elif "]: ok" in line:
+        emit(c(DIM, f"{now()} [BACKUP] слот {msg}"))
+
+RE_PRP_EXP = re.compile(r"^\d{8} [\d:]{8} (\d+) ")
+
+# ---------------------------------------------------------------- слежение за файлами
+class Follow:
+    def __init__(self, path, existed=True):
+        # existed=False: файл появился после старта монитора — читаем с начала и НЕ молча
+        self.path, self.pos, self.ino, self.buf = path, (None if existed else 0), None, ""
+        self.silent_first = existed
+
+    def lines(self, backlog=262144):
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return [], False
+        first = self.pos is None
+        if self.ino is None and not first:
+            self.ino = st.st_ino
+        if first or st.st_ino != self.ino or st.st_size < self.pos:
+            self.pos = max(0, st.st_size - backlog) if first else 0
+            self.ino = st.st_ino; self.buf = ""
+        if st.st_size == self.pos:
+            return [], first
+        with open(self.path, "rb") as f:
+            f.seek(self.pos); data = f.read(); self.pos = f.tell()
+        text = self.buf + data.decode("utf-8", "replace").replace("\r", "\n")
+        parts = text.split("\n"); self.buf = parts.pop()
+        return parts, first
+
+def main():
+    lockf = open(os.path.join(DATA, ".monitor.lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("gimps-monitor уже запущен — второй экземпляр не нужен", file=sys.stderr)
+        time.sleep(30); return
+    followers, workers = {}, {}
+    emit(c(B, f"══ {now()} gimps-monitor запущен: прогресс по каждому 1%, файл {OUT} ══"))
+    cpu_load()
+    initial = set(glob.glob(os.path.join(LOGS, "*.log")))
+    last_wd = 0
+    while True:
+        for path in sorted(glob.glob(os.path.join(LOGS, "*.log"))):
+            name = os.path.basename(path)[:-4]
+            m = re.match(r"(tf|prp)-gpu(\d+)$", name)
+            kind, idx = None, None
+            if m:
+                kind, idx = m[1].upper(), int(m[2])
+            elif name == "cpu":
+                kind, idx = "CPU", -1
+            elif re.match(r"apn-gpu\d+$", name):
+                kind, idx = "APN", int(name[7:])
+            elif re.match(r"tune-gpu\d+$", name):
+                kind, idx = "TUNE", int(name[8:])
+            elif name == "backup":
+                kind = "BACKUP"
+            if not kind:
+                continue
+            f = followers.get(path) or followers.setdefault(path, Follow(path, existed=path in initial))
+            lines, first = f.lines()
+            for ln in lines:
+                try:
+                    if kind == "APN":
+                        mc = RE_CREDIT.search(ln)
+                        if mc:
+                            exp, g = int(mc[1]), float(mc[2])
+                            # тип — по режиму этой GPU (какой лог воркера обновлялся последним)
+                            def mt(n):
+                                try:
+                                    return os.path.getmtime(os.path.join(LOGS, n))
+                                except OSError:
+                                    return 0
+                            kd = "PRP" if mt(f"prp-gpu{idx}.log") >= mt(f"tf-gpu{idx}.log") and mt(f"prp-gpu{idx}.log") else "TF"
+                            hist_add(kd, exp, g)
+                            if not first:
+                                emit(c(G, f"   {now()} GPU{idx}: PrimeNet засчитал M{exp}: {g:.3f} GHz-d"))
+                                if NOTIFY_ALL:
+                                    notify(f"GPU{idx}: PrimeNet засчитал M{exp}: {g:.3f} GHz-d")
+                    elif kind == "TUNE":
+                        handle_tune(idx, ln, first)
+                    elif kind == "BACKUP":
+                        handle_backup(ln, first)
+                    elif kind == "PRP":
+                        # PRPLL может считать несколько экспонент (-workers N): своё состояние на каждую
+                        me = RE_PRP_EXP.match(ln)
+                        exp = int(me[1]) if me else None
+                        if exp is None and '"exponent"' in ln:
+                            mj = re.search(r'"exponent"\s*:\s*"?(\d+)', ln)
+                            exp = int(mj[1]) if mj else None
+                        if exp is None:
+                            continue
+                        key = f"{name}:{exp}"
+                        w = workers.get(key)
+                        if w is None:
+                            w = workers[key] = Worker("PRP", idx)
+                            w.exp, w.started = exp, time.time()
+                        handle_prp(w, ln, first)
+                        if w.exp is None:              # задача завершена — состояние больше не нужно
+                            workers.pop(key, None)
+                    else:
+                        w = workers.setdefault(name, Worker(kind, idx))
+                        {"TF": handle_tf, "CPU": handle_cpu}[kind](w, ln, first)
+                except Exception as e:                  # монитор не должен падать из-за странной строки
+                    print(f"[monitor] {name}: {e}", file=sys.stderr)
+            if first and kind in ("TF", "PRP", "CPU"):
+                for key, w in list(workers.items()):
+                    if (key == name or key.startswith(name + ":")) and w.task:
+                        emit(c(B, f"── {now()} {w.label}: сейчас в работе — {w.task}, {w.last_int if w.last_int >= 0 else '?'}%"))
+                        emit(c(DIM, "   " + w.snap_full()))
+        if time.time() - last_wd >= 30:
+            last_wd = time.time()
+            try:
+                watchdog()
+            except Exception as e:
+                print(f"[monitor] watchdog: {e}", file=sys.stderr)
+        time.sleep(POLL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

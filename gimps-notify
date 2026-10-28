@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""gimps-notify "текст" — отправить уведомление (Telegram и/или вебхук). Без настроек — молча ничего не делает.
+
+  NOTIFY_TELEGRAM_TOKEN   токен бота (@BotFather)
+  NOTIFY_TELEGRAM_CHAT    chat_id (свой id можно узнать у @userinfobot)
+  NOTIFY_WEBHOOK_URL      любой URL, принимающий POST с текстом (например https://ntfy.sh/<ваш-топик>)
+  GIMPS_NAME              подпись машины в сообщении
+Ошибки сети не прерывают работу (код возврата всегда 0).
+"""
+import json, os, sys, urllib.parse, urllib.request
+
+def load_env():
+    p = os.path.join(os.environ.get("DATA_DIR", "/data"), "gimps.env")
+    try:
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.replace("export ", "").strip()
+                os.environ.setdefault(k, v.strip().strip("'\""))
+    except OSError:
+        pass
+
+def send(text):
+    who = os.environ.get("GIMPS_NAME") or os.uname().nodename
+    text = f"[{who}] {text}"
+    tok, chat = os.environ.get("NOTIFY_TELEGRAM_TOKEN"), os.environ.get("NOTIFY_TELEGRAM_CHAT")
+    if tok and chat:
+        try:
+            data = urllib.parse.urlencode({"chat_id": chat, "text": text[:4000]}).encode()
+            urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data, timeout=20).read()
+        except Exception as e:
+            print(f"gimps-notify: Telegram: {e}", file=sys.stderr)
+    url = os.environ.get("NOTIFY_WEBHOOK_URL")
+    if url:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, text.encode(), {"Content-Type": "text/plain; charset=utf-8"}),
+                                   timeout=20).read()
+        except Exception as e:
+            print(f"gimps-notify: webhook: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    load_env()
+    if len(sys.argv) > 1:
+        send(" ".join(sys.argv[1:]))
+    sys.exit(0)
