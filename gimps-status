@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Сводка: GPU, задания и ETA по каждому воркеру, последние строки логов.
+set -uo pipefail
+DATA_DIR="${DATA_DIR:-/data}"
+
+echo "===== GPU ====="
+nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,memory.used --format=csv
+echo
+for d in "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu*; do
+  [ -d "$d" ] || continue
+  n="$(basename "$d")"
+  echo "===== $n ====="
+  echo "--- задания (worktodo):"
+  cat "$d"/worktodo*.txt 2>/dev/null | grep -v '^\s*$' || echo "(пусто)"
+  echo "--- отправлено результатов: $(cat "$d"/results*.txt 2>/dev/null | grep -c . )"
+  echo "--- лог воркера:"
+  tail -n 4 "$DATA_DIR/logs/${n}.log" 2>/dev/null
+  echo "--- лог AutoPrimeNet:"
+  tail -n 3 "$DATA_DIR/logs/apn-${n#*-}.log" 2>/dev/null
+  echo
+done
+[ -f "$DATA_DIR/.stop" ] && echo "(стоп-флаг установлен — воркеры остановлены)"

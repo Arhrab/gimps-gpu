@@ -1,0 +1,4 @@
+.git
+*.md
+make-bootstrap.sh
+bootstrap.sh

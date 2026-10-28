@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Остановка GIMPS.
+#   gimps-stop              — корректно остановить воркеры (чекпойнт), отправить результаты. Задания остаются за вами.
+#   gimps-stop --finish     — НЕ брать новые задания; текущие досчитать (воркеры продолжают работать)
+#   gimps-stop --unreserve  — остановить и ВЕРНУТЬ все незавершённые задания в PrimeNet
+#                             (делайте это перед удалением VM, если не будете продолжать!)
+set -uo pipefail
+DATA_DIR="${DATA_DIR:-/data}"
+APN="python3 $(command -v autoprimenet.py)"
+dirs=( "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu* )
+
+each_dir() { for d in "${dirs[@]}"; do [ -f "$d/prime.ini" ] && { echo "== $d"; $APN -w "$d" "$@"; }; done; }
+
+if [ "${1:-}" = "--finish" ]; then
+  pkill -f '^python3 .*autoprimenet.py -w'; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
+  each_dir --no-more-work
+  echo "Новые задания больше не берутся. Когда gimps-status покажет пустую очередь — можно останавливать."
+  exit 0
+fi
+
+touch "$DATA_DIR/.stop"
+pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc
+echo "Жду сохранения чекпойнтов..."
+for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc' >/dev/null || break; sleep 1; done
+pkill -f '^python3 .*autoprimenet.py -w' ; sleep 2
+echo "Отправляю результаты и proof-файлы..."
+each_dir --upload-proofs
+[ "${1:-}" = "--unreserve" ] && { echo "Возвращаю задания в PrimeNet..."; each_dir --unreserve-all; }
+[ -f "$DATA_DIR/gimps-start.pid" ] && kill "$(cat "$DATA_DIR/gimps-start.pid")" 2>/dev/null; rm -f "$DATA_DIR/gimps-start.pid"
+echo "Готово."

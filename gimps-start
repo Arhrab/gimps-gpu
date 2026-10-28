@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Запуск GIMPS на всех (или выбранных) GPU: на каждую GPU — свой воркер (PRPLL или mfaktc)
+# и свой AutoPrimeNet, каждый в своей папке $DATA_DIR/<mode>-gpu<N>.
+#
+#   gimps-start            — в foreground (для Docker ENTRYPOINT)
+#   gimps-start --daemon   — в фоне (для onstart-скрипта vast.ai / RunPod / ssh)
+#
+# Настройки — переменные окружения (или файл $DATA_DIR/gimps.env):
+#   GIMPS_USER       логин PrimeNet (mersenne.org). По умолчанию ANONYMOUS
+#   GIMPS_MODE       prp (PRPLL, тесты на простоту) | tf (mfaktc, trial factoring). По умолч. prp
+#   GIMPS_WORKPREF   тип работы PrimeNet. По умолч.: 150 (first-time PRP) для prp, 12 для tf
+#   GIMPS_GPUS       список GPU через запятую, напр. "0,1". По умолч. все
+#   GIMPS_NAME       префикс имени компьютера в PrimeNet. По умолч. "cloud"
+#   GIMPS_DAYS_WORK  на сколько дней брать задания. По умолч. 1
+#   PRPLL_BACKEND    cuda | opencl. По умолч. cuda
+#   PRPLL_TUNE       1 = перед первым запуском прогнать "prpll -tune" (долго, но быстрее потом)
+#   PRPLL_ARGS       доп. аргументы PRPLL
+#   APN_ARGS         доп. аргументы AutoPrimeNet (напр. "--cert-work")
+#   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ. По умолч. 30
+#   DATA_DIR         где хранить всё состояние. По умолч. /data
+set -uo pipefail
+
+DATA_DIR="${DATA_DIR:-/data}"
+mkdir -p "$DATA_DIR/logs"
+[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+
+if [ "${1:-}" = "--daemon" ]; then
+  setsid nohup "$0" >>"$DATA_DIR/logs/gimps-start.log" 2>&1 < /dev/null &
+  echo "gimps-start запущен в фоне (pid $!). Лог: $DATA_DIR/logs/gimps-start.log ; статус: gimps-status"
+  exit 0
+fi
+
+GIMPS_USER="${GIMPS_USER:-ANONYMOUS}"
+GIMPS_MODE="${GIMPS_MODE:-prp}"
+GIMPS_NAME="${GIMPS_NAME:-cloud}"
+GIMPS_DAYS_WORK="${GIMPS_DAYS_WORK:-1}"
+PRPLL_BACKEND="${PRPLL_BACKEND:-cuda}"
+PROOF_DISK_GB="${PROOF_DISK_GB:-30}"
+case "$GIMPS_MODE" in
+  prp) WORKPREF="${GIMPS_WORKPREF:-150}" ;;
+  tf)  WORKPREF="${GIMPS_WORKPREF:-12}" ;;
+  *) echo "GIMPS_MODE должен быть prp или tf" >&2; exit 2 ;;
+esac
+case "$PRPLL_BACKEND" in
+  cuda)   PRPLL_BIN=prpll-cuda ;;
+  opencl) PRPLL_BIN=prpll-ocl ;;
+  *) echo "PRPLL_BACKEND должен быть cuda или opencl" >&2; exit 2 ;;
+esac
+APN="python3 $(command -v autoprimenet.py)"
+STOP_FLAG="$DATA_DIR/.stop"
+rm -f "$STOP_FLAG"
+echo $$ > "$DATA_DIR/gimps-start.pid"
+
+ts() { date '+%F %T'; }
+log() { echo "[$(ts)] $*"; }
+
+if ! nvidia-smi -L >/dev/null 2>&1; then
+  log "ОШИБКА: nvidia-smi не видит GPU. Контейнер запущен без --gpus all / без NVIDIA runtime?"; exit 1
+fi
+if [ -n "${GIMPS_GPUS:-}" ]; then
+  IFS=',' read -r -a GPUS <<< "$GIMPS_GPUS"
+else
+  mapfile -t GPUS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+fi
+[ "$GIMPS_USER" = "ANONYMOUS" ] && log "ВНИМАНИЕ: GIMPS_USER не задан — работаю как ANONYMOUS (результаты не попадут в ваш аккаунт)"
+log "Режим: $GIMPS_MODE, workpref=$WORKPREF, пользователь=$GIMPS_USER, GPU: ${GPUS[*]}"
+
+# бесконечный перезапуск команды, пока нет стоп-флага
+forever() {
+  local name="$1"; shift
+  local logf="$DATA_DIR/logs/$name.log"
+  while [ ! -f "$STOP_FLAG" ]; do
+    log "старт: $*" >>"$logf"
+    "$@" >>"$logf" 2>&1
+    local rc=$?
+    [ -f "$STOP_FLAG" ] && break
+    log "$name завершился (rc=$rc), перезапуск через 60 с" >>"$logf"
+    sleep 60
+  done
+}
+
+shutdown() {
+  log "Получен сигнал остановки — корректно останавливаю воркеры (сохранение чекпойнтов)"
+  touch "$STOP_FLAG"
+  pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc
+  for _ in $(seq 1 90); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc' >/dev/null || break; sleep 1; done
+  pkill -f '^python3 .*autoprimenet.py -w'
+  rm -f "$DATA_DIR/gimps-start.pid"
+  wait
+  log "Остановлено"
+  exit 0
+}
+trap shutdown INT TERM
+
+for g in "${GPUS[@]}"; do
+  g="$(echo "$g" | tr -d ' ')"
+  dir="$DATA_DIR/${GIMPS_MODE}-gpu${g}"
+  mkdir -p "$dir"
+  gpu_name="$(nvidia-smi -i "$g" --query-gpu=name --format=csv,noheader | head -1)"
+  gpu_mem="$(nvidia-smi -i "$g" --query-gpu=memory.total --format=csv,noheader,nounits | head -1)"
+  cname="${GIMPS_NAME}-${GIMPS_MODE}${g}"
+  log "GPU $g: $gpu_name (${gpu_mem} MiB) -> $dir, computer=$cname"
+
+  apn_common=(-w "$dir" -u "$GIMPS_USER" -T "$WORKPREF" -H "$cname" -W "$GIMPS_DAYS_WORK"
+              --processor-model "$gpu_name" --no-version-check --no-color)
+  if [ "$GIMPS_MODE" = "prp" ]; then
+    apn_args=(--prpll "${apn_common[@]}" --max-disk-space "$PROOF_DISK_GB")
+  else
+    apn_args=(--mfaktc "${apn_common[@]}")
+    [ -f "$dir/mfaktc.ini" ] || cp /opt/gimps/share/mfaktc.ini "$dir/mfaktc.ini"
+  fi
+  # shellcheck disable=SC2086
+  ( forever "apn-gpu$g" $APN "${apn_args[@]}" ${APN_ARGS:-} ) &
+
+  sleep 20   # даём AutoPrimeNet зарегистрироваться и получить первое задание
+
+  if [ "$GIMPS_MODE" = "prp" ]; then
+    if [ "${PRPLL_TUNE:-0}" = "1" ] && [ ! -f "$dir/tune.txt" ]; then
+      log "GPU $g: prpll -tune (может занять 30–90 минут)..."
+      ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && "$PRPLL_BIN" -d 0 -dir "$dir" -tune >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
+    fi
+    # shellcheck disable=SC2086
+    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "prp-gpu$g" "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
+  else
+    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "tf-gpu$g" mfaktc -d 0 ) &
+  fi
+done
+
+log "Запущено. Логи: $DATA_DIR/logs/  Статус: gimps-status"
+wait
