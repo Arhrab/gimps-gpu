@@ -233,7 +233,9 @@ cat > "$D/gimps-start" <<'__GIMPS_EOF__'
 #   PRPLL_WORKERS    сколько PRP-тестов одновременно на одной GPU (PRPLL -workers). По умолч. 1
 #   PRPLL_TUNE       auto (по умолч.) = один раз на модель GPU, версию PRPLL и диапазон экспонент прогнать
 #                    "prpll -tune" (кэш в $DATA_DIR/tune-cache, бэкапится); 0 = не тюнить; 1 = перетюнить
-#   PRPLL_TUNE_ARGS  параметры тюнинга. По умолч. "inplace,exp=<диапазон из worktodo>"
+#                    RTX 30 и старше (compute capability < 8.9) не тюнятся: выигрыш мал (PRPLL_TUNE=1 — всё же тюнить)
+#   PRPLL_TUNE_ARGS  параметры тюнинга. По умолч. "inplace,exp=<экспонента задания ±3%, кратно 5M>"
+#   PRPLL_TUNE_MAX_MIN  предел времени тюнинга, мин. По умолч. 20 (не уложился — работа с настройками по умолчанию)
 #   PRPLL_CACHE      1 (по умолч.) = кэш скомпилированных ядер PRPLL (-cache): быстрый перезапуск
 #   PRPLL_ARGS       доп. аргументы PRPLL
 #   PRP_PROOF_POWER  proof power для PRP (по умолч. 6: 64 остатка, ~1,1 ГБ на тест 140M)
@@ -252,8 +254,30 @@ cat > "$D/gimps-start" <<'__GIMPS_EOF__'
 set -uo pipefail
 
 DATA_DIR="${DATA_DIR:-/data}"
+# sshd (StrictModes) отвергает ключи, если /root, ~/.ssh или authorized_keys не принадлежат root или доступны на запись
+# другим («bad ownership or modes»): так бывает на части хостов vast.ai. Чиним до старта sshd (On-start идёт раньше).
+if [ "$(id -u)" = 0 ]; then
+  # vast.ai может дописать ключи уже после On-start (с чужим владельцем), поэтому надёжнее отключить StrictModes
+  if [ -f /etc/ssh/sshd_config ] && ! grep -q '^StrictModes no' /etc/ssh/sshd_config; then
+    sed -i 's/^#\?StrictModes.*//' /etc/ssh/sshd_config; echo 'StrictModes no' >> /etc/ssh/sshd_config
+  fi
+  chown root:root /root 2>/dev/null; chmod go-w /root 2>/dev/null
+  if [ -d /root/.ssh ]; then
+    chown -R root:root /root/.ssh 2>/dev/null; chmod 700 /root/.ssh 2>/dev/null
+    chmod 600 /root/.ssh/authorized_keys 2>/dev/null
+  fi
+fi
 mkdir -p "$DATA_DIR/logs"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+# Переменные из On-start (ключи R2, логин, уведомления…) не видны в SSH-сессии, поэтому gimps-stop/gimps-backup,
+# запущенные вручную, их бы не знали. Сохраняем их в $DATA_DIR/.onstart.env (права 600, в бэкап не попадает).
+# Перезаписываем только когда переменные действительно переданы (ручной запуск из SSH без них файл не затрёт).
+if [ "${GIMPS_DAEMON:-0}" != "1" ] && compgen -v | grep -qE '^(GIMPS_USER|BACKUP_)'; then
+  ( umask 077
+    for k in $(compgen -v | grep -E '^(GIMPS_|BACKUP_|NOTIFY_|PRPLL_|PRP_PROOF_POWER|PROOF_DISK_GB|GPU_SELFTEST|WATCHDOG_MIN|EE_MAX_PER_HOUR|APN_ARGS|LOG_MAX_MB|CPU_|RCLONE_)' | grep -vx 'GIMPS_DAEMON'); do
+      printf 'export %s=%q\n' "$k" "${!k}"
+    done > "$DATA_DIR/.onstart.env.new" ) && mv -f "$DATA_DIR/.onstart.env.new" "$DATA_DIR/.onstart.env"
+fi
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 
 if [ "${1:-}" = "--daemon" ]; then
   GIMPS_DAEMON=1 setsid nohup "$0" >>"$DATA_DIR/logs/gimps-start.log" 2>&1 < /dev/null &
@@ -429,15 +453,15 @@ shutdown() {
 trap shutdown INT TERM
 
 # ---------------------------------------------------------------- PRPLL: тюнинг и самотест
-# Диапазон экспонент для тюнинга — из полученных заданий (±10%, округлено до 25M, чтобы кэш не сбрасывался
-# из-за каждого нового задания), иначе 110M–200M (first-time PRP).
+# Диапазон экспонент для тюнинга — узкий, вокруг полученных заданий (±3%, кратно 5M): тюнятся 1–2 размера FFT
+# вместо всего диапазона, это в разы быстрее. Кэш с более широким покрывающим диапазоном используется повторно.
 tune_range() {
   local dir="$1" lo hi
   # строки вида PRP=<AID>,1,2,<экспонента>,-1,77,0 — берём первое число 1M…10^10 после AID
   read -r lo hi < <(cat "$dir"/worktodo*.txt 2>/dev/null \
     | awk -F'[=,]' '/^[A-Za-z]+=/ {for(i=3;i<=NF;i++) if ($i ~ /^[0-9]+$/ && length($i) <= 10 && $i+0 > 1000000) {print $i; break}}' \
-    | sort -n | awk 'NR==1{lo=$1} {hi=$1} END{if (NR) {l=int(lo*0.9/25e6)*25; h=int(hi*1.1/25e6+0.999)*25; if (l<1) l=1; printf "%d %d\n", l, h}}')
-  if [ -n "${lo:-}" ]; then echo "exp=${lo}M-${hi}M"; else echo "exp=110M-200M"; fi
+    | sort -n | awk 'NR==1{lo=$1} {hi=$1} END{if (NR) {l=int(lo*0.97/5e6)*5; h=int(hi*1.03/5e6+0.999)*5; if (l<1) l=1; printf "%d %d\n", l, h}}')
+  if [ -n "${lo:-}" ]; then echo "exp=${lo}M-${hi}M"; else echo "exp=150M-165M"; fi
 }
 
 # Тюнинг под модель GPU: один раз, кэш (config.txt + tune.txt) на модель + бэкенд + версию PRPLL + диапазон.
@@ -447,8 +471,29 @@ prpll_tune() {
   [ "$mode" = "0" ] && return 0
   local ver; ver="$(cat /opt/gimps/PRPLL_VERSION 2>/dev/null || echo unknown)"
   local args="${PRPLL_TUNE_ARGS:-inplace,$(tune_range "$dir")}"
-  local slug; slug="$(echo "$name-$PRPLL_BACKEND-$ver-${args##*exp=}" | tr -c 'A-Za-z0-9.\n-' '_')"
+  local prefix; prefix="$(echo "$name-$PRPLL_BACKEND-$ver-" | tr -c 'A-Za-z0-9.\n-' '_')"
+  local slug; slug="$prefix$(echo "${args##*exp=}" | tr -c 'A-Za-z0-9.\n-' '_')"
   local cache="$DATA_DIR/tune-cache/$slug"
+  # уже есть тюнинг этой модели/версии на более широкий диапазон, покрывающий нужный, — берём его
+  if [ "$mode" != "1" ] && [ ! -s "$cache/tune.txt" ]; then
+    local want="${args##*exp=}" wlo whi d r clo chi
+    wlo="${want%%M-*}"; whi="${want##*-}"; whi="${whi%M}"
+    for d in "$DATA_DIR/tune-cache/$prefix"*; do
+      [ -s "$d/tune.txt" ] || continue
+      r="${d##*/$prefix}"; clo="${r%%M-*}"; chi="${r##*-}"; chi="${chi%M}"
+      if [[ "$clo$chi$wlo$whi" =~ ^[0-9]+$ ]] && [ "$clo" -le "$wlo" ] && [ "$chi" -ge "$whi" ]; then
+        cache="$d"; break
+      fi
+    done
+  fi
+  # RTX 30 и старше (compute capability < 8.9): выигрыш от тюнинга мал — не тратим на него время (PRPLL_TUNE=1 — всё же тюнить)
+  if [ "$mode" != "1" ] && [ ! -s "$cache/tune.txt" ]; then
+    local cc; cc="$(nvidia-smi -i "$g" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+    if [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] && awk -v c="$cc" 'BEGIN{exit !(c < 8.9)}'; then
+      log "GPU $g: $name (CC $cc, RTX 30 или старше) — тюнинг пропущен, настройки PRPLL по умолчанию (принудительно: PRPLL_TUNE=1)"
+      return 0
+    fi
+  fi
   mkdir -p "$cache"
   (
     flock 9                                            # одинаковые GPU тюнятся один раз, остальные ждут
@@ -457,9 +502,11 @@ prpll_tune() {
       log "GPU $g: тюнинг не удавался меньше суток назад — пропускаю (повтор: PRPLL_TUNE=1)"; exit 0
     fi
     if [ "$mode" = "1" ] || [ ! -s "$cache/tune.txt" ]; then
-      plog "GPU $g: ТЮНИНГ PRPLL под $name (-tune $args), обычно 20–60 мин; ход — в gimps-watch, лог logs/tune-gpu$g.log"
+      local tmax="${PRPLL_TUNE_MAX_MIN:-20}"
+      plog "GPU $g: ТЮНИНГ PRPLL под $name (-tune $args), обычно 5–15 мин, не дольше $tmax мин; ход — в gimps-watch, лог logs/tune-gpu$g.log"
       local tdir; tdir="$(mktemp -d "$DATA_DIR/tune-run.XXXX")"
-      ( cd "$tdir" && "$PRPLL_BIN" -d 0 -dir "$tdir" -cache -tune "$args" >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
+      ( cd "$tdir" && timeout -k 30 "$(( tmax * 60 ))" "$PRPLL_BIN" -d 0 -dir "$tdir" -cache -tune "$args" >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
+      [ $? -eq 124 ] && log "GPU $g: тюнинг прерван по лимиту $tmax мин (PRPLL_TUNE_MAX_MIN)"
       if [ -s "$tdir/tune.txt" ]; then
         cp "$tdir/tune.txt" "$cache/tune.txt"; [ -f "$tdir/config.txt" ] && cp "$tdir/config.txt" "$cache/config.txt"
         rm -f "$cache/.failed"
@@ -492,6 +539,9 @@ gpu_selftest() {
     touch "$ok"; rm -rf "$t"; plog "GPU $g: самотест пройден"; return 0
   fi
   rm -rf "$t"
+  if grep -q 'cuInit failed' "$DATA_DIR/logs/selftest-gpu$g.log" 2>/dev/null; then
+    plog "ОШИБКА: GPU $g: CUDA не инициализируется (cuInit failed) — драйвер/хост неисправен, смените машину"
+  fi
   echo "самотест PRPLL не пройден $(ts) — см. logs/selftest-gpu$g.log" > "$DATA_DIR/.disabled-prp-gpu$g"
   plog "ОШИБКА: GPU $g ($name) не прошла самотест — воркер выключен. Хост/драйвер неисправен? См. logs/selftest-gpu$g.log"
   notify "GPU $g ($name) НЕ прошла самотест PRPLL — воркер выключен, смените машину"
@@ -541,10 +591,10 @@ for g in "${GPUS[@]}"; do
     # shellcheck disable=SC2086
     ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && prpll_tune "$g" "$dir" "$gpu_name" \
         && gpu_selftest "$g" "$gpu_name" \
-        && forever "prp-gpu$g" "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
+        && forever "prp-gpu$g" stdbuf -oL -eL "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
   else
     # mfaktc при каждом запуске сам прогоняет короткий самотест и не стартует, если он не прошёл
-    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "tf-gpu$g" mfaktc -d 0 ) &
+    ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "tf-gpu$g" stdbuf -oL -eL mfaktc -d 0 ) &
   fi
 done
 rm -f "$DATA_DIR/.restored-from-backup"
@@ -572,7 +622,7 @@ cat > "$D/gimps-stop" <<'__GIMPS_EOF__'
 #                             (делайте это перед удалением VM, если не будете продолжать!)
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 APN="python3 $(command -v autoprimenet.py)"
 dirs=( "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu* )
 
@@ -592,7 +642,8 @@ touch "$DATA_DIR/.stop"
 pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
 echo "Жду сохранения чекпойнтов..."
 for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
-pkill -f '^python3 .*autoprimenet.py -w' ; sleep 2
+pkill -f '^python3 .*autoprimenet.py -w'
+for _ in $(seq 1 15); do pgrep -f '^python3 .*autoprimenet.py -w' >/dev/null || break; sleep 1; done
 echo "Отправляю результаты и proof-файлы..."
 each_dir --upload-proofs
 backup_on=0
@@ -606,7 +657,11 @@ elif [ $backup_on = 1 ]; then
   echo "Финальный бэкап во внешнее хранилище..."; gimps-backup
 fi
 [ -f "$DATA_DIR/gimps-start.pid" ] && kill "$(cat "$DATA_DIR/gimps-start.pid")" 2>/dev/null; rm -f "$DATA_DIR/gimps-start.pid"
-echo "Готово."
+# gimps-start и его фоновые циклы должны выйти сами (стоп-флаг); если кто-то задержался — завершаем принудительно
+for _ in $(seq 1 30); do pgrep -f 'bash .*/gimps-start' >/dev/null || break; sleep 1; done
+pkill -TERM -f 'bash .*/gimps-start' 2>/dev/null; sleep 3; pkill -KILL -f 'bash .*/gimps-start' 2>/dev/null
+pkill -f '^python3 .*autoprimenet.py -w' 2>/dev/null; pkill -f 'python3 .*/gimps-monitor' 2>/dev/null
+echo "Готово. Запуск заново: gimps-start --daemon"
 __GIMPS_EOF__
 cat > "$D/gimps-status" <<'__GIMPS_EOF__'
 #!/usr/bin/env bash
@@ -693,7 +748,7 @@ cat > "$D/gimps-backup" <<'__GIMPS_EOF__'
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR/logs"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 
 BASE_NAME="${BACKUP_NAME:-gimps}"
 INTERVAL="${BACKUP_INTERVAL_MIN:-30}"
@@ -744,7 +799,7 @@ RC=(rclone --config /dev/null --transfers 4 --checkers 16 --retries 3 --retries-
     --low-level-retries 10 --contimeout 30s --timeout 5m --stats 0 -q)
 EXCL=(--exclude "logs/**" --exclude ".snap/**" --exclude "*.new" --exclude "~lock" --exclude ".stop"
       --exclude "gimps-start.pid" --exclude ".machine-id" --exclude ".backup-ok" --exclude ".backup-slot"
-      --exclude ".backup.lock" --exclude ".gimps-start.lock" --exclude "kernel-cache/**" --exclude "gimps.env"
+      --exclude ".backup.lock" --exclude ".gimps-start.lock" --exclude "kernel-cache/**" --exclude "gimps.env" --exclude ".onstart.env*"
       --exclude "tune-run.*/**" --exclude "**/.lock" --exclude "*.lck" --exclude "*.write"
       --exclude ".selftest-ok-*" --exclude ".disabled-*" --exclude ".pid-*" --exclude ".restored-from-backup"
       --exclude ".monitor.lock" --exclude "gpuowl-*.log" --exclude "autoprimenet.log*")
@@ -1422,6 +1477,12 @@ def watchdog():
             last = os.path.getmtime(os.path.join(LOGS, f"{name}.log"))
         except OSError:
             continue
+        # PRPLL ведёт и собственный лог (gpuowl-*.log) — учитываем самый свежий из логов воркера
+        for f in glob.glob(os.path.join(DATA, name, "gpuowl-*.log")):
+            try:
+                last = max(last, os.path.getmtime(f))
+            except OSError:
+                pass
         if t - started < limit or t - last < limit:
             continue
         rs = [x for x in _wd_restarts.get(name, []) if t - x < 3 * 3600] + [t]
@@ -1612,7 +1673,7 @@ cat > "$D/gimps-cpu-setup" <<'__GIMPS_EOF__'
 # Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_MEM_GB (auto), DATA_DIR
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 D="$DATA_DIR/cpu"; mkdir -p "$D"; cd "$D" || exit 1
 for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
 
@@ -1681,7 +1742,10 @@ cat > "$D/gimps-notify" <<'__GIMPS_EOF__'
 import json, os, sys, urllib.parse, urllib.request
 
 def load_env():
-    p = os.path.join(os.environ.get("DATA_DIR", "/data"), "gimps.env")
+    for name in (".onstart.env", "gimps.env"):
+        load_file(os.path.join(os.environ.get("DATA_DIR", "/data"), name))
+
+def load_file(p):
     try:
         for line in open(p, encoding="utf-8"):
             line = line.strip()

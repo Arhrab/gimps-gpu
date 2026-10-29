@@ -4,7 +4,7 @@
 # Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_MEM_GB (auto), DATA_DIR
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 D="$DATA_DIR/cpu"; mkdir -p "$D"; cd "$D" || exit 1
 for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
 

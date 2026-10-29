@@ -10,7 +10,10 @@
 import json, os, sys, urllib.parse, urllib.request
 
 def load_env():
-    p = os.path.join(os.environ.get("DATA_DIR", "/data"), "gimps.env")
+    for name in (".onstart.env", "gimps.env"):
+        load_file(os.path.join(os.environ.get("DATA_DIR", "/data"), name))
+
+def load_file(p):
     try:
         for line in open(p, encoding="utf-8"):
             line = line.strip()

@@ -33,7 +33,7 @@
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR/logs"
-[ -f "$DATA_DIR/gimps.env" ] && set -a && . "$DATA_DIR/gimps.env" && set +a
+for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 
 BASE_NAME="${BACKUP_NAME:-gimps}"
 INTERVAL="${BACKUP_INTERVAL_MIN:-30}"
@@ -84,7 +84,7 @@ RC=(rclone --config /dev/null --transfers 4 --checkers 16 --retries 3 --retries-
     --low-level-retries 10 --contimeout 30s --timeout 5m --stats 0 -q)
 EXCL=(--exclude "logs/**" --exclude ".snap/**" --exclude "*.new" --exclude "~lock" --exclude ".stop"
       --exclude "gimps-start.pid" --exclude ".machine-id" --exclude ".backup-ok" --exclude ".backup-slot"
-      --exclude ".backup.lock" --exclude ".gimps-start.lock" --exclude "kernel-cache/**" --exclude "gimps.env"
+      --exclude ".backup.lock" --exclude ".gimps-start.lock" --exclude "kernel-cache/**" --exclude "gimps.env" --exclude ".onstart.env*"
       --exclude "tune-run.*/**" --exclude "**/.lock" --exclude "*.lck" --exclude "*.write"
       --exclude ".selftest-ok-*" --exclude ".disabled-*" --exclude ".pid-*" --exclude ".restored-from-backup"
       --exclude ".monitor.lock" --exclude "gpuowl-*.log" --exclude "autoprimenet.log*")

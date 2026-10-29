@@ -460,6 +460,12 @@ def watchdog():
             last = os.path.getmtime(os.path.join(LOGS, f"{name}.log"))
         except OSError:
             continue
+        # PRPLL ведёт и собственный лог (gpuowl-*.log) — учитываем самый свежий из логов воркера
+        for f in glob.glob(os.path.join(DATA, name, "gpuowl-*.log")):
+            try:
+                last = max(last, os.path.getmtime(f))
+            except OSError:
+                pass
         if t - started < limit or t - last < limit:
             continue
         rs = [x for x in _wd_restarts.get(name, []) if t - x < 3 * 3600] + [t]
