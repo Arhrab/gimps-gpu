@@ -80,8 +80,11 @@ fi
 # одинаковая нумерация GPU у CUDA, OpenCL и nvidia-smi (иначе CUDA ставит «самую быструю» первой)
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
-host="$(hostname)"
-if [[ "$host" =~ ^C\.([0-9]+)$ ]]; then def_name="vast${BASH_REMATCH[1]}"; else def_name="cloud"; fi
+# vast.ai: hostname контейнера — случайный хеш, номер инстанса — в VAST_CONTAINERLABEL (C.<id>) / CONTAINER_ID
+host="${VAST_CONTAINERLABEL:-$(hostname)}"
+if [[ "$host" =~ ^C\.([0-9]+)$ ]]; then def_name="vast${BASH_REMATCH[1]}"
+elif [[ "${CONTAINER_ID:-}" =~ ^[0-9]+$ ]]; then def_name="vast$CONTAINER_ID"
+else def_name="cloud"; fi
 export GIMPS_NAME="${GIMPS_NAME:-$def_name}"
 export BACKUP_NAME="${BACKUP_NAME:-gimps}"          # не зависит от имени машины — иначе новая машина не найдёт бэкап
 GIMPS_USER="${GIMPS_USER:-ANONYMOUS}"

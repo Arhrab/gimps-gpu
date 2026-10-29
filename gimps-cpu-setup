@@ -12,12 +12,12 @@ for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
 # сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
 alloc="$(nproc)"
 if [ -r /sys/fs/cgroup/cpu.max ]; then
-  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( (q + p - 1) / p ))
+  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( q / p ))   # 46.08 CPU → 46: не превышаем квоту
 elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
   q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-  [ "$q" -gt 0 ] && alloc=$(( (q + p - 1) / p ))
+  [ "$q" -gt 0 ] && alloc=$(( q / p ))
 fi
-[ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
+[ "$alloc" -lt 1 ] && alloc=1; [ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
 tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
 phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
 # одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
@@ -30,20 +30,23 @@ if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "
 fi
 MEM="${CPU_MEM_GB:-$(( mem_kb / 1024 / 1024 / 2 ))}"; [ "$MEM" -gt 64 ] && MEM=64; [ "$MEM" -lt 1 ] && MEM=1
 
-# Число потоков mprime — явно в local.txt: в контейнере mprime видит все ядра хоста, а не выделенные нам.
-# (Ключи NumWorkers / CoresPerTest — из local.txt Prime95 v29+; mprime перечитывает их при старте.)
+# Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
+# каждом старте задаём их заново. mprime 30.x хранит их в prime.txt (раньше — в local.txt); правим оба, если есть.
 enforce_cores() {
-  [ -f local.txt ] || return 0
-  local k v
-  for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    if grep -q "^$k=" local.txt; then sed -i "s/^$k=.*/$k=$v/" local.txt; else echo "$k=$v" >> local.txt; fi
+  local f k v mem_mb=$(( MEM * 1024 ))
+  for f in prime.txt local.txt; do
+    [ -f "$f" ] || continue
+    for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      if grep -q "^$k=" "$f"; then sed -i "s/^$k=.*/$k=$v/" "$f"; elif [ "$f" = prime.txt ]; then echo "$k=$v" >> "$f"; fi
+    done
+    grep -q '^Memory=' "$f" && sed -i "s/^Memory=.*/Memory=$mem_mb during 7:30-23:30 else $mem_mb/" "$f"
   done
 }
 
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
   enforce_cores
-  echo "mprime уже настроен ($D/prime.txt), потоков: $CORES. Перенастроить: gimps-cpu-setup --force"; exit 0
+  echo "mprime уже настроен ($D/prime.txt); для этой машины: потоков $CORES, память stage 2 $MEM ГиБ. Перенастроить: gimps-cpu-setup --force"; exit 0
 fi
 
 USERID="${GIMPS_USER:-ANONYMOUS}"

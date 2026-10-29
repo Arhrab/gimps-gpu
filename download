@@ -1,0 +1,5 @@
+.git
+*.md
+make-bootstrap.sh
+bootstrap.sh
+test-monitor.sh

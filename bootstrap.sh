@@ -295,8 +295,11 @@ fi
 # одинаковая нумерация GPU у CUDA, OpenCL и nvidia-smi (иначе CUDA ставит «самую быструю» первой)
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
-host="$(hostname)"
-if [[ "$host" =~ ^C\.([0-9]+)$ ]]; then def_name="vast${BASH_REMATCH[1]}"; else def_name="cloud"; fi
+# vast.ai: hostname контейнера — случайный хеш, номер инстанса — в VAST_CONTAINERLABEL (C.<id>) / CONTAINER_ID
+host="${VAST_CONTAINERLABEL:-$(hostname)}"
+if [[ "$host" =~ ^C\.([0-9]+)$ ]]; then def_name="vast${BASH_REMATCH[1]}"
+elif [[ "${CONTAINER_ID:-}" =~ ^[0-9]+$ ]]; then def_name="vast$CONTAINER_ID"
+else def_name="cloud"; fi
 export GIMPS_NAME="${GIMPS_NAME:-$def_name}"
 export BACKUP_NAME="${BACKUP_NAME:-gimps}"          # не зависит от имени машины — иначе новая машина не найдёт бэкап
 GIMPS_USER="${GIMPS_USER:-ANONYMOUS}"
@@ -1394,6 +1397,8 @@ def handle_cpu(w, line, silent):
         if not silent:
             emit(c(G, f"   {now()} CPU: PrimeNet засчитал {g:.3f} GHz-d"))
         return
+    if "Sending result" in line or "Comm thread" in line:   # дубль строки результата при отправке на сервер
+        return
     if any(s in line for s in ("is not prime", "completed P-1", "found a factor", "has a factor", "is a probable prime",
                                "completed ECM", "Mersenne number is prime")):
         good = "factor" in line or "prime!" in line.lower() or "probable prime" in line
@@ -1401,7 +1406,7 @@ def handle_cpu(w, line, silent):
     me = RE_MP_EXP.search(line); mp = RE_MP_PCT.search(line)
     # новая задача — по строке старта/возобновления или по строке прогресса с другой (или первой после
     # перезапуска монитора/восстановления из бэкапа) экспонентой: «[Worker …] M… stage 1 is 25.58% complete»
-    if me and ("Starting" in line or "Resuming" in line or "P-1 on" in line or "PRP test of" in line
+    if me and ("Starting" in line or "Resuming" in line or "P-1 on" in line or "P-1 factoring of" in line or "PRP test of" in line
                or "ECM on" in line or (mp and (not w.exp or int(me[1]) != w.exp))):
         if w.exp != int(me[1]):
             w.reset(); w.exp = int(me[1]); w.started = time.time()
@@ -1695,12 +1700,12 @@ for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
 # сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
 alloc="$(nproc)"
 if [ -r /sys/fs/cgroup/cpu.max ]; then
-  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( (q + p - 1) / p ))
+  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( q / p ))   # 46.08 CPU → 46: не превышаем квоту
 elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
   q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-  [ "$q" -gt 0 ] && alloc=$(( (q + p - 1) / p ))
+  [ "$q" -gt 0 ] && alloc=$(( q / p ))
 fi
-[ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
+[ "$alloc" -lt 1 ] && alloc=1; [ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
 tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
 phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
 # одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
@@ -1713,20 +1718,23 @@ if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "
 fi
 MEM="${CPU_MEM_GB:-$(( mem_kb / 1024 / 1024 / 2 ))}"; [ "$MEM" -gt 64 ] && MEM=64; [ "$MEM" -lt 1 ] && MEM=1
 
-# Число потоков mprime — явно в local.txt: в контейнере mprime видит все ядра хоста, а не выделенные нам.
-# (Ключи NumWorkers / CoresPerTest — из local.txt Prime95 v29+; mprime перечитывает их при старте.)
+# Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
+# каждом старте задаём их заново. mprime 30.x хранит их в prime.txt (раньше — в local.txt); правим оба, если есть.
 enforce_cores() {
-  [ -f local.txt ] || return 0
-  local k v
-  for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    if grep -q "^$k=" local.txt; then sed -i "s/^$k=.*/$k=$v/" local.txt; else echo "$k=$v" >> local.txt; fi
+  local f k v mem_mb=$(( MEM * 1024 ))
+  for f in prime.txt local.txt; do
+    [ -f "$f" ] || continue
+    for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      if grep -q "^$k=" "$f"; then sed -i "s/^$k=.*/$k=$v/" "$f"; elif [ "$f" = prime.txt ]; then echo "$k=$v" >> "$f"; fi
+    done
+    grep -q '^Memory=' "$f" && sed -i "s/^Memory=.*/Memory=$mem_mb during 7:30-23:30 else $mem_mb/" "$f"
   done
 }
 
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
   enforce_cores
-  echo "mprime уже настроен ($D/prime.txt), потоков: $CORES. Перенастроить: gimps-cpu-setup --force"; exit 0
+  echo "mprime уже настроен ($D/prime.txt); для этой машины: потоков $CORES, память stage 2 $MEM ГиБ. Перенастроить: gimps-cpu-setup --force"; exit 0
 fi
 
 USERID="${GIMPS_USER:-ANONYMOUS}"

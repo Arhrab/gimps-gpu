@@ -37,6 +37,15 @@ cat >> "$L/cpu.log" <<'EOF'
 [Work thread Oct 28 15:01] M139876543 stage 1 is 0.52% complete. Time: 30.123 sec.
 [Work thread Oct 28 15:02] M139876543 stage 1 is 1.50% complete. Time: 30.123 sec.
 EOF
+# возобновление после восстановления из бэкапа (mprime 30.19: «[Worker …]» без строки Starting)
+printf '%s\n' "[Worker Oct 29 07:08] M162527719 stage 1 is 25.58% complete. Time: 18.112 sec." \
+  "[Worker Oct 29 07:08] M162527719 stage 1 is 26.25% complete. Time: 17.623 sec." >> "$L/cpu.log"
+# реальный формат mprime 30.19: завершение, дубль при отправке, старт следующей задачи без «Starting», stage 2
+printf '%s\n' "[Worker Oct 29 08:30] M162527719 completed P-1, B1=1033000, B2=221227050, Wi8: 6196E6B0" \
+  "[Comm thread Oct 29 08:30] Sending result to server: UID: arhrab/cloud-cpu, M162527719 completed P-1, B1=1033000, B2=221227050, Wi8: 6196E6B0, AID: 46794A99D4BD8893BFD387D806A5B552" \
+  "[Worker Oct 29 08:30] Optimal P-1 factoring of M162527777 using up to 65536MB of memory." \
+  "[Worker Oct 29 08:31] M162527777 stage 1 is 0.66% complete. Time: 25.262 sec." \
+  "[Worker Oct 29 09:50] M162527777 stage 2 at B2=205123050 [91.50%].  Time: 16.693 sec." >> "$L/cpu.log"
 echo "[2026-10-28 15:30:00] backup[gimps]: хранилище недоступно — синхронизация пропущена" >> "$L/backup.log"
 sleep 5
 fail=0
@@ -52,6 +61,10 @@ check "M141234567: составное"
 check "PrimeNet засчитал M141234567"
 check "НОВАЯ ЗАДАЧА ━━ P-1 M139876543"
 check "[BACKUP] слот gimps: хранилище недоступно"
+check "НОВАЯ ЗАДАЧА ━━ P-1 M162527719"
+check "НОВАЯ ЗАДАЧА ━━ P-1 M162527777"
+check "M162527777  91.50%"
+[ "$(grep -c 'M162527719 completed P-1' "$T/out")" = 1 ] || { echo "результат CPU продублирован"; fail=1; }
 grep -q '"kind": "PRP", "exp": 141234567' "$T/data/.credit-history.json" || { echo "кредит не записан как PRP"; fail=1; }
 [ -s "$T/err" ] && { echo "ошибки монитора:"; cat "$T/err"; fail=1; }
 if [ $fail = 0 ]; then echo "test-monitor: OK"; else echo "--- вывод монитора:"; cat "$T/out"; fi
