@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Первичная настройка mprime (Prime95 для Linux) для расчётов на CPU параллельно с GPU.
 # Вызывается из gimps-start автоматически; вручную: gimps-cpu-setup [--force]
-# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_MEM_GB (auto), DATA_DIR
+# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_WORKERS (auto: 2 при ≥32 ядрах),
+#             CPU_MEM_GB (auto), DATA_DIR
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
 for f in "$DATA_DIR/.onstart.env" "$DATA_DIR/gimps.env"; do [ -f "$f" ] && set -a && . "$f" && set +a; done
 D="$DATA_DIR/cpu"; mkdir -p "$D"; cd "$D" || exit 1
-for f in /opt/gimps/mprime/*; do [ -e "$(basename "$f")" ] || ln -s "$f" .; done
+for f in /opt/gimps/mprime/*; do [ -e "$f" ] && { [ -e "$(basename "$f")" ] || ln -s "$f" .; }; done
 
 
 # сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
@@ -23,6 +24,11 @@ phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
 # одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
 CORES="${CPU_CORES:-$(( phys > 1 ? phys - 1 : 1 ))}"
 
+# воркеры: на больших CPU два P-1 параллельно дают больше, чем один на всех ядрах (P-1 упирается в память,
+# а не в число ядер: EPYC 46 ядер — 1×45 ≈ 2,5 %/мин stage 1, 2×22 ≈ 2,8 %/мин). CPU_WORKERS — вручную.
+WORKERS="${CPU_WORKERS:-$(( CORES >= 32 ? 2 : 1 ))}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
+PER=$(( CORES / WORKERS )); [ "$PER" -lt 1 ] && PER=1
+
 # память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
 mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
 if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
@@ -33,20 +39,33 @@ MEM="${CPU_MEM_GB:-$(( mem_kb / 1024 / 1024 / 2 ))}"; [ "$MEM" -gt 64 ] && MEM=6
 # Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
 # каждом старте задаём их заново. mprime 30.x хранит их в prime.txt (раньше — в local.txt); правим оба, если есть.
 enforce_cores() {
-  local f k v mem_mb=$(( MEM * 1024 ))
+  local f k v w mem_mb=$(( MEM * 1024 )) type="${CPU_WORKPREF:-4}"
   for f in prime.txt local.txt; do
     [ -f "$f" ] || continue
-    for kv in "NumWorkers=1" "CoresPerTest=$CORES"; do
+    for kv in "NumWorkers=$WORKERS" "CoresPerTest=$PER"; do
       k="${kv%%=*}"; v="${kv#*=}"
-      if grep -q "^$k=" "$f"; then sed -i "s/^$k=.*/$k=$v/" "$f"; elif [ "$f" = prime.txt ]; then echo "$k=$v" >> "$f"; fi
+      if grep -q "^$k=" "$f"; then sed -i "s/^$k=.*/$k=$v/" "$f"; elif [ "$f" = prime.txt ]; then sed -i "1i $k=$v" "$f"; fi
     done
     grep -q '^Memory=' "$f" && sed -i "s/^Memory=.*/Memory=$mem_mb during 7:30-23:30 else $mem_mb/" "$f"
+  done
+  # тип работы — каждому воркеру явно (иначе новый воркер получает от сервера что угодно: PRP, double-check…)
+  [ -f prime.txt ] || return 0
+  sed -i "s/^WorkPreference=.*/WorkPreference=$type/" prime.txt
+  grep -q '^WorkPreference=' prime.txt || sed -i "1i WorkPreference=$type" prime.txt
+  for w in $(seq 1 "$WORKERS"); do
+    if grep -q "^\[Worker #$w\]" prime.txt; then
+      awk -v w="[Worker #$w]" -v t="$type" '
+        $0==w {print; print "WorkPreference=" t; f=1; next}
+        /^\[/ {f=0} f && /^WorkPreference=/ {next} {print}' prime.txt > prime.txt.new && mv prime.txt.new prime.txt
+    else
+      printf '\n[Worker #%s]\nWorkPreference=%s\n' "$w" "$type" >> prime.txt
+    fi
   done
 }
 
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
   enforce_cores
-  echo "mprime уже настроен ($D/prime.txt); для этой машины: потоков $CORES, память stage 2 $MEM ГиБ. Перенастроить: gimps-cpu-setup --force"; exit 0
+  echo "mprime уже настроен ($D/prime.txt); для этой машины: воркеров $WORKERS × $PER ядер, память stage 2 $MEM ГиБ. Перенастроить: gimps-cpu-setup --force"; exit 0
 fi
 
 USERID="${GIMPS_USER:-ANONYMOUS}"
@@ -54,11 +73,11 @@ NAME="${GIMPS_NAME:-cloud}-cpu"
 TYPE="${CPU_WORKPREF:-4}"
 echo "mprime: пользователь=$USERID, компьютер=$NAME, тип работы=$TYPE, ядер=$CORES (выделено CPU: $alloc), память stage 2=$MEM ГиБ"
 [ "${1:-}" = "--force" ] && rm -f prime.txt local.txt
-timeout 900 expect /opt/gimps/share/mprime-setup.exp "$USERID" "$NAME" "$TYPE" "$CORES" "$MEM" > setup.log 2>&1
+timeout 900 expect /opt/gimps/share/mprime-setup.exp "$USERID" "$NAME" "$TYPE" "$PER" "$MEM" > setup.log 2>&1
 rc=$?
 if grep -qs '^V5UserID=' prime.txt; then
   enforce_cores
-  echo "mprime настроен (лог: $D/setup.log), потоков: $CORES"; exit 0
+  echo "mprime настроен (лог: $D/setup.log), воркеров: $WORKERS × $PER ядер"; exit 0
 fi
 echo "mprime: автонастройка не удалась (rc=$rc), см. $D/setup.log. Можно настроить вручную: cd $D && ./mprime -m"
 exit 1
