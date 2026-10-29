@@ -1388,12 +1388,15 @@ def handle_prp(w, line, silent):
             w.done(f"M{e}: составное (res64 {r.get('res64','?')}), {r.get('worktype','PRP')}"
                    + (f", ошибок {w.errors}" if w.errors else ""), silent=silent)
 
+_cpu_last_done = [None, None]          # (тип, экспонента) последней завершённой CPU-задачи — для строки кредита
+
 def handle_cpu(w, line, silent):
     m = RE_MP_CREDIT.search(line)
     if m:
         g = float(m[1])
-        if w.exp:
-            hist_add(w.subtype or "CPU", w.exp, g)
+        sub, exp = (w.subtype, w.exp) if w.exp else tuple(_cpu_last_done)
+        if exp:
+            hist_add(sub or "CPU", exp, g)
         if not silent:
             emit(c(G, f"   {now()} CPU: PrimeNet засчитал {g:.3f} GHz-d"))
         return
@@ -1402,6 +1405,7 @@ def handle_cpu(w, line, silent):
     if any(s in line for s in ("is not prime", "completed P-1", "found a factor", "has a factor", "is a probable prime",
                                "completed ECM", "Mersenne number is prime")):
         good = "factor" in line or "prime!" in line.lower() or "probable prime" in line
+        _cpu_last_done[:] = [w.subtype or "CPU", w.exp]
         w.done(re.sub(r"^\[.*?\]\s*", "", line.strip()), good=good, silent=silent); return
     me = RE_MP_EXP.search(line); mp = RE_MP_PCT.search(line)
     # новая задача — по строке старта/возобновления или по строке прогресса с другой (или первой после
@@ -1637,13 +1641,22 @@ def main():
                         if w.exp is None:              # задача завершена — состояние больше не нужно
                             workers.pop(key, None)
                     else:
-                        w = workers.setdefault(name, Worker(kind, idx))
+                        key = name
+                        if kind == "CPU":           # mprime с несколькими воркерами: «[Worker #2 …]» — своё состояние
+                            mw = re.match(r"\s*\[Worker #(\d+)", ln)
+                            if mw:
+                                key = f"{name}#{mw[1]}"
+                        w = workers.get(key)
+                        if w is None:
+                            w = workers[key] = Worker(kind, idx)
+                            if key != name:
+                                w.label = f"CPU#{key.rsplit('#', 1)[1]}"
                         {"TF": handle_tf, "CPU": handle_cpu}[kind](w, ln, first)
                 except Exception as e:                  # монитор не должен падать из-за странной строки
                     print(f"[monitor] {name}: {e}", file=sys.stderr)
             if first and kind in ("TF", "PRP", "CPU"):
                 for key, w in list(workers.items()):
-                    if (key == name or key.startswith(name + ":")) and w.task:
+                    if (key == name or key.startswith(name + ":") or key.startswith(name + "#")) and w.task:
                         emit(c(B, f"── {now()} {w.label}: сейчас в работе — {w.task}, {w.last_int if w.last_int >= 0 else '?'}%"))
                         emit(c(DIM, "   " + w.snap_full()))
         if time.time() - last_wd >= 30:
@@ -1689,7 +1702,7 @@ cat > "$D/gimps-cpu-setup" <<'__GIMPS_EOF__'
 #!/usr/bin/env bash
 # Первичная настройка mprime (Prime95 для Linux) для расчётов на CPU параллельно с GPU.
 # Вызывается из gimps-start автоматически; вручную: gimps-cpu-setup [--force]
-# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_WORKERS (auto: 2 при ≥32 ядрах),
+# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_WORKERS (по умолч. 1),
 #             CPU_MEM_GB (auto), DATA_DIR
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
@@ -1712,9 +1725,10 @@ phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
 # одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
 CORES="${CPU_CORES:-$(( phys > 1 ? phys - 1 : 1 ))}"
 
-# воркеры: на больших CPU два P-1 параллельно дают больше, чем один на всех ядрах (P-1 упирается в память,
-# а не в число ядер: EPYC 46 ядер — 1×45 ≈ 2,5 %/мин stage 1, 2×22 ≈ 2,8 %/мин). CPU_WORKERS — вручную.
-WORKERS="${CPU_WORKERS:-$(( CORES >= 32 ? 2 : 1 ))}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
+# воркеры: по умолчанию один на все ядра. Замер на EPYC 9474F (46 ядер, P-1 ~162M): 1×45 — 2,5 %/мин stage 1,
+# 2×22 — 2,35 %/мин (оба в stage 1; P-1 упирается в память), а одному воркеру stage 2 достаётся вся память.
+# CPU_WORKERS=N — вручную (ядра делятся поровну, тип работы прописывается каждому воркеру).
+WORKERS="${CPU_WORKERS:-1}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
 PER=$(( CORES / WORKERS )); [ "$PER" -lt 1 ] && PER=1
 
 # память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
@@ -1750,6 +1764,22 @@ enforce_cores() {
     fi
   done
 }
+
+# Сохранения mprime для экспонент, которых нет в очереди (задание возвращено/завершено), больше не нужны,
+# а PRP-остатки для proof весят гигабайты (p<exp>.residues) и раздувают бэкап. mprime в этот момент не запущен.
+clean_orphans() {
+  [ -s worktodo.txt ] || return 0
+  local f e n=0
+  for f in [pmefc][0-9]*; do
+    [ -f "$f" ] || continue
+    e="${f:1}"; e="${e%%.*}"
+    [[ "$e" =~ ^[0-9]+$ ]] || continue
+    grep -qE "(^|[=,])$e(,|$)" worktodo.txt && continue
+    rm -f -- "$f"; n=$((n + 1))
+  done
+  [ $n -gt 0 ] && echo "mprime: удалено старых файлов сохранения (экспонент нет в очереди): $n"
+}
+clean_orphans
 
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
   enforce_cores

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Первичная настройка mprime (Prime95 для Linux) для расчётов на CPU параллельно с GPU.
 # Вызывается из gimps-start автоматически; вручную: gimps-cpu-setup [--force]
-# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_WORKERS (auto: 2 при ≥32 ядрах),
+# Переменные: GIMPS_USER, GIMPS_NAME, CPU_WORKPREF (по умолч. 4 = P-1), CPU_CORES (auto), CPU_WORKERS (по умолч. 1),
 #             CPU_MEM_GB (auto), DATA_DIR
 set -uo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
@@ -24,9 +24,10 @@ phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
 # одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
 CORES="${CPU_CORES:-$(( phys > 1 ? phys - 1 : 1 ))}"
 
-# воркеры: на больших CPU два P-1 параллельно дают больше, чем один на всех ядрах (P-1 упирается в память,
-# а не в число ядер: EPYC 46 ядер — 1×45 ≈ 2,5 %/мин stage 1, 2×22 ≈ 2,8 %/мин). CPU_WORKERS — вручную.
-WORKERS="${CPU_WORKERS:-$(( CORES >= 32 ? 2 : 1 ))}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
+# воркеры: по умолчанию один на все ядра. Замер на EPYC 9474F (46 ядер, P-1 ~162M): 1×45 — 2,5 %/мин stage 1,
+# 2×22 — 2,35 %/мин (оба в stage 1; P-1 упирается в память), а одному воркеру stage 2 достаётся вся память.
+# CPU_WORKERS=N — вручную (ядра делятся поровну, тип работы прописывается каждому воркеру).
+WORKERS="${CPU_WORKERS:-1}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
 PER=$(( CORES / WORKERS )); [ "$PER" -lt 1 ] && PER=1
 
 # память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
@@ -62,6 +63,22 @@ enforce_cores() {
     fi
   done
 }
+
+# Сохранения mprime для экспонент, которых нет в очереди (задание возвращено/завершено), больше не нужны,
+# а PRP-остатки для proof весят гигабайты (p<exp>.residues) и раздувают бэкап. mprime в этот момент не запущен.
+clean_orphans() {
+  [ -s worktodo.txt ] || return 0
+  local f e n=0
+  for f in [pmefc][0-9]*; do
+    [ -f "$f" ] || continue
+    e="${f:1}"; e="${e%%.*}"
+    [[ "$e" =~ ^[0-9]+$ ]] || continue
+    grep -qE "(^|[=,])$e(,|$)" worktodo.txt && continue
+    rm -f -- "$f"; n=$((n + 1))
+  done
+  [ $n -gt 0 ] && echo "mprime: удалено старых файлов сохранения (экспонент нет в очереди): $n"
+}
+clean_orphans
 
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
   enforce_cores

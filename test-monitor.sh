@@ -46,6 +46,11 @@ printf '%s\n' "[Worker Oct 29 08:30] M162527719 completed P-1, B1=1033000, B2=22
   "[Worker Oct 29 08:30] Optimal P-1 factoring of M162527777 using up to 65536MB of memory." \
   "[Worker Oct 29 08:31] M162527777 stage 1 is 0.66% complete. Time: 25.262 sec." \
   "[Worker Oct 29 09:50] M162527777 stage 2 at B2=205123050 [91.50%].  Time: 16.693 sec." >> "$L/cpu.log"
+# два воркера mprime вперемешку — у каждого своё состояние, без «НОВАЯ ЗАДАЧА» на каждой строке
+printf '%s\n' "[Worker #1 Oct 29 11:57] M162527929 stage 2 at B2=218182800 [95.07%].  Time: 24.697 sec." \
+  "[Worker #2 Oct 29 11:57] M162571597 stage 1 is 63.78% complete. Time: 31.131 sec." \
+  "[Worker #1 Oct 29 11:58] M162527929 stage 2 at B2=219182800 [96.12%].  Time: 24.697 sec." \
+  "[Worker #2 Oct 29 11:58] M162571597 stage 1 is 64.45% complete. Time: 31.131 sec." >> "$L/cpu.log"
 echo "[2026-10-28 15:30:00] backup[gimps]: хранилище недоступно — синхронизация пропущена" >> "$L/backup.log"
 sleep 5
 fail=0
@@ -64,6 +69,8 @@ check "[BACKUP] слот gimps: хранилище недоступно"
 check "НОВАЯ ЗАДАЧА ━━ P-1 M162527719"
 check "НОВАЯ ЗАДАЧА ━━ P-1 M162527777"
 check "M162527777  91.50%"
+[ "$(grep -c 'НОВАЯ ЗАДАЧА ━━ P-1 M162527929' "$T/out")" = 1 ] || { echo "CPU#1: задача объявлена не один раз"; fail=1; }
+check "CPU#2: НОВАЯ ЗАДАЧА ━━ P-1 M162571597"
 [ "$(grep -c 'M162527719 completed P-1' "$T/out")" = 1 ] || { echo "результат CPU продублирован"; fail=1; }
 grep -q '"kind": "PRP", "exp": 141234567' "$T/data/.credit-history.json" || { echo "кредит не записан как PRP"; fail=1; }
 [ -s "$T/err" ] && { echo "ошибки монитора:"; cat "$T/err"; fail=1; }
