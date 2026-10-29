@@ -915,6 +915,12 @@ do_sync() {
   fi
 }
 
+# режим GPU-заданий в слоте: prp / tf / пусто (только CPU или нет данных)
+slot_mode() {
+  local dirs; dirs="$("${RC[@]}" lsf --dirs-only --max-depth 1 "$1/data" 2>/dev/null)"
+  if grep -q '^prp-gpu' <<<"$dirs"; then echo prp; elif grep -q '^tf-gpu' <<<"$dirs"; then echo tf; fi
+}
+
 restore_from() {   # $1 — слот
   local p; p="$(slot_path "$1")"
   REMOTE="$p"
@@ -932,11 +938,16 @@ do_claim() {
     [ -f "$SLOT_FILE" ] || echo 1 > "$SLOT_FILE"
     log "локальные данные есть — работаю со своим слотом"; return 0
   fi
-  local i s stale="" empty=""
+  local i s m stale="" empty="" mode="${GIMPS_MODE:-prp}"
   for i in $(seq 1 $MAX_SLOTS); do
     s="$(slot_state "$(slot_path "$i")")" || { log "хранилище недоступно (сеть / ключи / бакет) — не стартую с нуля"; return 5; }
     case "$s" in
-      stale|mine) [ -z "$stale" ] && stale=$i ;;
+      stale|mine)
+        # GPU-задания брошенного слота должна продолжить машина того же режима (prp/tf), иначе они встанут
+        m="$(slot_mode "$(slot_path "$i")")"
+        if [ -n "$m" ] && [ "$m" != "$mode" ]; then
+          log "слот $(basename "$(slot_path "$i")") брошен, но в нём задания $m, а эта машина — $mode: оставляю его машине $m"
+        elif [ -z "$stale" ]; then stale=$i; fi ;;
       empty)      [ -z "$empty" ] && empty=$i ;;
     esac
     [ -n "$stale" ] && break                 # брошенная машина важнее пустого слота
@@ -1388,11 +1399,14 @@ def handle_cpu(w, line, silent):
         good = "factor" in line or "prime!" in line.lower() or "probable prime" in line
         w.done(re.sub(r"^\[.*?\]\s*", "", line.strip()), good=good, silent=silent); return
     me = RE_MP_EXP.search(line); mp = RE_MP_PCT.search(line)
-    if me and ("Starting" in line or "P-1 on" in line or "PRP test of" in line or "ECM on" in line
-               or (mp and w.exp and int(me[1]) != w.exp)):
+    # новая задача — по строке старта/возобновления или по строке прогресса с другой (или первой после
+    # перезапуска монитора/восстановления из бэкапа) экспонентой: «[Worker …] M… stage 1 is 25.58% complete»
+    if me and ("Starting" in line or "Resuming" in line or "P-1 on" in line or "PRP test of" in line
+               or "ECM on" in line or (mp and (not w.exp or int(me[1]) != w.exp))):
         if w.exp != int(me[1]):
             w.reset(); w.exp = int(me[1]); w.started = time.time()
-        sub = "P-1" if "P-1" in line else "PRP" if "PRP" in line else "ECM" if "ECM" in line else w.subtype or "CPU"
+        sub = ("P-1" if ("P-1" in line or re.search(r"[Ss]tage \d", line)) else "PRP" if "PRP" in line
+               else "ECM" if "ECM" in line else w.subtype or "CPU")
         w.subtype = sub
         w.task = f"{sub} M{w.exp} на CPU (mprime)"
         est = ghd_estimate(sub, w.exp)
