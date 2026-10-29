@@ -21,8 +21,11 @@ fi
 [ "$alloc" -lt 1 ] && alloc=1; [ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
 tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
 phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
-# одно ядро оставляем GPU-воркерам (mfaktc/PRPLL)
-CORES="${CPU_CORES:-$(( phys > 1 ? phys - 1 : 1 ))}"
+# по одному ядру оставляем каждому GPU-воркеру (PRPLL/mfaktc держат по потоку на карту)
+if [ -n "${GIMPS_GPUS:-}" ]; then ngpu=$(tr ',' '\n' <<<"$GIMPS_GPUS" | grep -c .)
+else ngpu=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); fi
+[ "${ngpu:-0}" -lt 1 ] && ngpu=1
+CORES="${CPU_CORES:-$(( phys > ngpu ? phys - ngpu : 1 ))}"
 
 # воркеры: по умолчанию 2 (если ядер ≥ 4), ядра делятся поровну, память stage 2 mprime делит между ними сам.
 # Замер на EPYC 9474F (46 ядер, P-1 ~162M): 1×45 — 2,5 %/мин stage 1, 2×22 — 2,35–2,8 %/мин; два воркера
