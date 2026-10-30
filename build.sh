@@ -31,7 +31,7 @@ RCLONE_SHA256_amd64="349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccd
 RCLONE_SHA256_arm64="7e1e8d69654941b7b7df84ee74c5f7fb09cce7d5496947fb7bf16b55ff427d10"
 # Compute capabilities для mfaktc: RTX30/A10=86, RTX40/L4/L40=89, RTX50/RTX PRO 6000=120 — основные;
 # + T4/RTX20=75, A100=80, H100=90, B200=100, B300=103 — на всякий случай. Неподдерживаемые nvcc отфильтровываются.
-MFAKTC_ARCHS="${MFAKTC_ARCHS:-75 80 86 89 90 100 103 120}"
+MFAKTC_ARCHS="${MFAKTC_ARCHS:-61 70 75 80 86 89 90 100 103 120}"   # 61 — Pascal (GTX 10xx, TITAN Xp, P40), 70 — Volta (V100, TITAN V)
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 JOBS="${JOBS:-$(nproc)}"
 SRC="${SRC:-/tmp/gimps-src}"

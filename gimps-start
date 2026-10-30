@@ -18,7 +18,7 @@
 #   PRPLL_WORKERS    сколько PRP-тестов одновременно на одной GPU (PRPLL -workers). По умолч. 1
 #   PRPLL_TUNE       auto (по умолч.) = один раз на модель GPU, версию PRPLL и диапазон экспонент прогнать
 #                    "prpll -tune" (кэш в $DATA_DIR/tune-cache, бэкапится); 0 = не тюнить; 1 = перетюнить
-#                    RTX 30 и старше (compute capability < 8.9) не тюнятся: выигрыш мал (PRPLL_TUNE=1 — всё же тюнить)
+#                    (тюнинг нужен и старым картам: Quadro RTX 8000 — 4423 → 933 мкс/ит, в 4,7 раза быстрее)
 #   PRPLL_TUNE_ARGS  параметры тюнинга. По умолч. "inplace,exp=<экспонента задания ±3%, кратно 5M>"
 #   PRPLL_TUNE_MAX_MIN  предел времени тюнинга, мин. По умолч. 20 (не уложился — работа с настройками по умолчанию)
 #   PRPLL_CACHE      1 (по умолч.) = кэш скомпилированных ядер PRPLL (-cache): быстрый перезапуск
@@ -273,14 +273,6 @@ prpll_tune() {
         cache="$d"; break
       fi
     done
-  fi
-  # RTX 30 и старше (compute capability < 8.9): выигрыш от тюнинга мал — не тратим на него время (PRPLL_TUNE=1 — всё же тюнить)
-  if [ "$mode" != "1" ] && [ ! -s "$cache/tune.txt" ]; then
-    local cc; cc="$(nvidia-smi -i "$g" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
-    if [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] && awk -v c="$cc" 'BEGIN{exit !(c < 8.9)}'; then
-      log "GPU $g: $name (CC $cc, RTX 30 или старше) — тюнинг пропущен, настройки PRPLL по умолчанию (принудительно: PRPLL_TUNE=1)"
-      return 0
-    fi
   fi
   mkdir -p "$cache"
   (

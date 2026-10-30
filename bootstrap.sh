@@ -42,7 +42,7 @@ RCLONE_SHA256_amd64="349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccd
 RCLONE_SHA256_arm64="7e1e8d69654941b7b7df84ee74c5f7fb09cce7d5496947fb7bf16b55ff427d10"
 # Compute capabilities для mfaktc: RTX30/A10=86, RTX40/L4/L40=89, RTX50/RTX PRO 6000=120 — основные;
 # + T4/RTX20=75, A100=80, H100=90, B200=100, B300=103 — на всякий случай. Неподдерживаемые nvcc отфильтровываются.
-MFAKTC_ARCHS="${MFAKTC_ARCHS:-75 80 86 89 90 100 103 120}"
+MFAKTC_ARCHS="${MFAKTC_ARCHS:-61 70 75 80 86 89 90 100 103 120}"   # 61 — Pascal (GTX 10xx, TITAN Xp, P40), 70 — Volta (V100, TITAN V)
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 JOBS="${JOBS:-$(nproc)}"
 SRC="${SRC:-/tmp/gimps-src}"
@@ -233,7 +233,7 @@ cat > "$D/gimps-start" <<'__GIMPS_EOF__'
 #   PRPLL_WORKERS    сколько PRP-тестов одновременно на одной GPU (PRPLL -workers). По умолч. 1
 #   PRPLL_TUNE       auto (по умолч.) = один раз на модель GPU, версию PRPLL и диапазон экспонент прогнать
 #                    "prpll -tune" (кэш в $DATA_DIR/tune-cache, бэкапится); 0 = не тюнить; 1 = перетюнить
-#                    RTX 30 и старше (compute capability < 8.9) не тюнятся: выигрыш мал (PRPLL_TUNE=1 — всё же тюнить)
+#                    (тюнинг нужен и старым картам: Quadro RTX 8000 — 4423 → 933 мкс/ит, в 4,7 раза быстрее)
 #   PRPLL_TUNE_ARGS  параметры тюнинга. По умолч. "inplace,exp=<экспонента задания ±3%, кратно 5M>"
 #   PRPLL_TUNE_MAX_MIN  предел времени тюнинга, мин. По умолч. 20 (не уложился — работа с настройками по умолчанию)
 #   PRPLL_CACHE      1 (по умолч.) = кэш скомпилированных ядер PRPLL (-cache): быстрый перезапуск
@@ -488,14 +488,6 @@ prpll_tune() {
         cache="$d"; break
       fi
     done
-  fi
-  # RTX 30 и старше (compute capability < 8.9): выигрыш от тюнинга мал — не тратим на него время (PRPLL_TUNE=1 — всё же тюнить)
-  if [ "$mode" != "1" ] && [ ! -s "$cache/tune.txt" ]; then
-    local cc; cc="$(nvidia-smi -i "$g" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
-    if [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] && awk -v c="$cc" 'BEGIN{exit !(c < 8.9)}'; then
-      log "GPU $g: $name (CC $cc, RTX 30 или старше) — тюнинг пропущен, настройки PRPLL по умолчанию (принудительно: PRPLL_TUNE=1)"
-      return 0
-    fi
   fi
   mkdir -p "$cache"
   (
@@ -1712,16 +1704,20 @@ for f in /opt/gimps/mprime/*; do [ -e "$f" ] && { [ -e "$(basename "$f")" ] || l
 
 
 # сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
-alloc="$(nproc)"
+alloc="$(nproc)"; quota=0
 if [ -r /sys/fs/cgroup/cpu.max ]; then
-  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( q / p ))   # 46.08 CPU → 46: не превышаем квоту
+  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && { alloc=$(( q / p )); quota=1; }   # 46.08 CPU → 46: не превышаем квоту
 elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
   q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-  [ "$q" -gt 0 ] && alloc=$(( q / p ))
+  [ "$q" -gt 0 ] && { alloc=$(( q / p )); quota=1; }
 fi
 [ "$alloc" -lt 1 ] && alloc=1; [ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
 tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
-phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
+# Квота cgroup — это время логических CPU: 19.2 из 80 потоков хоста почти всегда раскладываются по разным
+# физическим ядрам, поэтому делить её на потоки-на-ядро нельзя (иначе mprime займёт лишь половину квоты).
+# Без квоты (весь сервер наш) — берём физические ядра: для FFT гипертрединг почти ничего не даёт.
+if [ "$quota" = 1 ] && [ "$alloc" -lt "$(nproc)" ]; then phys=$alloc; else phys=$(( alloc / tpc )); fi
+[ "$phys" -lt 1 ] && phys=1
 # по одному ядру оставляем каждому GPU-воркеру (PRPLL/mfaktc держат по потоку на карту)
 if [ -n "${GIMPS_GPUS:-}" ]; then ngpu=$(tr ',' '\n' <<<"$GIMPS_GPUS" | grep -c .)
 else ngpu=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); fi

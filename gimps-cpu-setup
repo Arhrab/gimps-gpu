@@ -11,16 +11,20 @@ for f in /opt/gimps/mprime/*; do [ -e "$f" ] && { [ -e "$(basename "$f")" ] || l
 
 
 # сколько CPU выделено контейнеру (cgroup v2 / v1), иначе — nproc
-alloc="$(nproc)"
+alloc="$(nproc)"; quota=0
 if [ -r /sys/fs/cgroup/cpu.max ]; then
-  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && alloc=$(( q / p ))   # 46.08 CPU → 46: не превышаем квоту
+  read -r q p < /sys/fs/cgroup/cpu.max; [ "$q" != "max" ] && { alloc=$(( q / p )); quota=1; }   # 46.08 CPU → 46: не превышаем квоту
 elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
   q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-  [ "$q" -gt 0 ] && alloc=$(( q / p ))
+  [ "$q" -gt 0 ] && { alloc=$(( q / p )); quota=1; }
 fi
 [ "$alloc" -lt 1 ] && alloc=1; [ "$alloc" -gt "$(nproc)" ] && alloc="$(nproc)"
 tpc="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"; tpc="${tpc:-1}"
-phys=$(( alloc / tpc )); [ "$phys" -lt 1 ] && phys=1
+# Квота cgroup — это время логических CPU: 19.2 из 80 потоков хоста почти всегда раскладываются по разным
+# физическим ядрам, поэтому делить её на потоки-на-ядро нельзя (иначе mprime займёт лишь половину квоты).
+# Без квоты (весь сервер наш) — берём физические ядра: для FFT гипертрединг почти ничего не даёт.
+if [ "$quota" = 1 ] && [ "$alloc" -lt "$(nproc)" ]; then phys=$alloc; else phys=$(( alloc / tpc )); fi
+[ "$phys" -lt 1 ] && phys=1
 # по одному ядру оставляем каждому GPU-воркеру (PRPLL/mfaktc держат по потоку на карту)
 if [ -n "${GIMPS_GPUS:-}" ]; then ngpu=$(tr ',' '\n' <<<"$GIMPS_GPUS" | grep -c .)
 else ngpu=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); fi
