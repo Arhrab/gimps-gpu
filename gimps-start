@@ -26,6 +26,7 @@
 #   PRP_PROOF_POWER  proof power для PRP (по умолч. 6: 64 остатка, ~1,1 ГБ на тест 140M)
 #   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ, сообщается PrimeNet. По умолч. 5
 #   GPU_SELFTEST     1 (по умолч.) = перед работой PRP-самотест GPU на известном простом M1257787 (раз в сутки)
+#   GPU_SELFTEST_MAX_MIN  предел времени самотеста, мин (по умолч. 60); не уложился — GPU не выключается
 #   WATCHDOG_MIN     перезапустить воркер, если его лог молчит дольше N минут. По умолч. 20 (0 — выкл.)
 #   EE_MAX_PER_HOUR  выключить PRP-воркер, если ошибок Gerbicz (EE) больше N за час. По умолч. 3
 #   APN_ARGS         доп. аргументы AutoPrimeNet (напр. "--cert-work")
@@ -74,8 +75,21 @@ fi
 # поэтому повторный запуск откажет, пока жив хотя бы один процесс прошлого запуска.
 exec 8>"$DATA_DIR/.gimps-start.lock"
 if ! flock -n 8; then
-  echo "[$(date '+%F %T')] gimps-start уже работает (или остались его воркеры). Статус: gimps-status; остановить: gimps-stop" >&2
-  exit 1
+  # Блокировку могли оставить «подвисшие» циклы прошлого запуска (после gimps-stop они досыпают паузу).
+  # Если никаких расчётов на самом деле не идёт — добиваем остатки и берём блокировку, иначе отказываем.
+  if pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null; then
+    echo "[$(date '+%F %T')] gimps-start уже работает. Статус: gimps-status; остановить: gimps-stop" >&2
+    exit 1
+  fi
+  echo "[$(date '+%F %T')] блокировку держат остатки прошлого запуска (расчётов нет) — убираю их" >&2
+  pkill -TERM -f 'bash .*/gimps-start' 2>/dev/null
+  pkill -f '^python3 .*autoprimenet\.py ' 2>/dev/null; sleep 3
+  pkill -KILL -f 'bash .*/gimps-start' 2>/dev/null; sleep 1
+  exec 8>"$DATA_DIR/.gimps-start.lock"
+  if ! flock -n 8; then
+    echo "[$(date '+%F %T')] не удалось освободить блокировку. Выполните: gimps-stop, затем gimps-start --daemon" >&2
+    exit 1
+  fi
 fi
 # одинаковая нумерация GPU у CUDA, OpenCL и nvidia-smi (иначе CUDA ставит «самую быструю» первой)
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -227,7 +241,7 @@ shutdown() {
   touch "$STOP_FLAG"
   pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
   for _ in $(seq 1 90); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
-  pkill -f '^python3 .*autoprimenet.py -w'
+  pkill -f '^python3 .*autoprimenet\.py '
   pkill -f '^python3 .*gimps-monitor'
   if [ "$BACKUP_ON" = "1" ] && [ $by_stop = 0 ]; then
     log "Финальный бэкап во внешнее хранилище..."
@@ -285,6 +299,7 @@ prpll_tune() {
       local tmax="${PRPLL_TUNE_MAX_MIN:-20}"
       plog "GPU $g: ТЮНИНГ PRPLL под $name (-tune $args), обычно 5–15 мин, не дольше $tmax мин; ход — в gimps-watch, лог logs/tune-gpu$g.log"
       local tdir; tdir="$(mktemp -d "$DATA_DIR/tune-run.XXXX")"
+      mkdir -p "$PWD/kernel-cache" && ln -sfn "$PWD/kernel-cache" "$tdir/kernel-cache"   # ядра — в общий кэш воркера
       ( cd "$tdir" && timeout -k 30 "$(( tmax * 60 ))" "$PRPLL_BIN" -d 0 -dir "$tdir" -cache -tune "$args" >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
       [ $? -eq 124 ] && log "GPU $g: тюнинг прерван по лимиту $tmax мин (PRPLL_TUNE_MAX_MIN)"
       if [ -s "$tdir/tune.txt" ]; then
@@ -314,11 +329,21 @@ gpu_selftest() {
   if [ -f "$ok" ] && [ $(( $(date +%s) - $(stat -c %Y "$ok") )) -lt 86400 ]; then return 0; fi
   local t; t="$(mktemp -d "$DATA_DIR/tune-run.st.XXXX")"
   plog "GPU $g: самотест PRPLL (M1257787 — известное простое)…"
-  ( cd "$t" && timeout 1200 "$PRPLL_BIN" -d 0 -dir "$t" -prp 1257787 -proof 0 >>"$DATA_DIR/logs/selftest-gpu$g.log" 2>&1 )
+  # кэш скомпилированных ядер — общий с воркером (папка воркера = текущая): на машинах со слабым CPU
+  # (Xeon Phi и т.п.) компиляция ядер NVRTC идёт десятки минут, второй раз её делать незачем
+  mkdir -p "$PWD/kernel-cache" && ln -sfn "$PWD/kernel-cache" "$t/kernel-cache"
+  local rc
+  ( cd "$t" && timeout -k 30 "${GPU_SELFTEST_MAX_MIN:-60}m" stdbuf -oL -eL "$PRPLL_BIN" -d 0 -dir "$t" -cache -prp 1257787 -proof 0 \
+      >>"$DATA_DIR/logs/selftest-gpu$g.log" 2>&1 ); rc=$?
   if grep -qE '"status" *: *"P"' "$t"/results*.txt 2>/dev/null; then
     touch "$ok"; rm -rf "$t"; plog "GPU $g: самотест пройден"; return 0
   fi
   rm -rf "$t"
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+    # не успел — это не ошибка вычислений (обычно медленная компиляция ядер на слабом CPU): не выключаем GPU
+    plog "GPU $g: самотест не уложился в ${GPU_SELFTEST_MAX_MIN:-60} мин (медленный CPU?) — пропускаю, работа продолжится"
+    return 0
+  fi
   if grep -q 'cuInit failed' "$DATA_DIR/logs/selftest-gpu$g.log" 2>/dev/null; then
     plog "ОШИБКА: GPU $g: CUDA не инициализируется (cuInit failed) — драйвер/хост неисправен, смените машину"
   fi

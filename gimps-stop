@@ -13,7 +13,7 @@ dirs=( "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu* )
 each_dir() { for d in "${dirs[@]}"; do [ -f "$d/prime.ini" ] && { echo "== $d"; $APN -w "$d" "$@"; }; done; }
 
 if [ "${1:-}" = "--finish" ]; then
-  pkill -f '^python3 .*autoprimenet.py -w'; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
+  pkill -f '^python3 .*autoprimenet\.py '; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
   each_dir --no-more-work
   echo "GPU: новые задания больше не берутся. Когда gimps-status покажет пустую очередь — можно останавливать."
   echo "     Запрет сохраняется при перезапуске этой машины; на машине, продолжившей слот из бэкапа, снимается сам."
@@ -26,8 +26,8 @@ touch "$DATA_DIR/.stop"
 pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
 echo "Жду сохранения чекпойнтов..."
 for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
-pkill -f '^python3 .*autoprimenet.py -w'
-for _ in $(seq 1 15); do pgrep -f '^python3 .*autoprimenet.py -w' >/dev/null || break; sleep 1; done
+pkill -f '^python3 .*autoprimenet\.py '
+for _ in $(seq 1 15); do pgrep -f '^python3 .*autoprimenet\.py ' >/dev/null || break; sleep 1; done
 echo "Отправляю результаты и proof-файлы..."
 each_dir --upload-proofs
 backup_on=0
@@ -44,5 +44,5 @@ fi
 # gimps-start и его фоновые циклы должны выйти сами (стоп-флаг); если кто-то задержался — завершаем принудительно
 for _ in $(seq 1 30); do pgrep -f 'bash .*/gimps-start' >/dev/null || break; sleep 1; done
 pkill -TERM -f 'bash .*/gimps-start' 2>/dev/null; sleep 3; pkill -KILL -f 'bash .*/gimps-start' 2>/dev/null
-pkill -f '^python3 .*autoprimenet.py -w' 2>/dev/null; pkill -f 'python3 .*/gimps-monitor' 2>/dev/null
+pkill -f '^python3 .*autoprimenet\.py ' 2>/dev/null; pkill -f 'python3 .*/gimps-monitor' 2>/dev/null
 echo "Готово. Запуск заново: gimps-start --daemon"

@@ -1,7 +1,9 @@
 #!/usr/bin/expect -f
 # Первичная настройка mprime без вопросов (на основе mprime.exp из
 # github.com/tdulcet/Distributed-Computing-Scripts, MIT License, © Teal Dulcet).
-# Запуск: expect mprime-setup.exp <User ID> <Computer name> <Type of work> <CPU cores> <Stage 2 memory GiB>
+# Запуск: expect mprime-setup.exp <User ID> <Computer name> <Type of work> <CPU cores per worker> <Stage 2 memory GiB> [workers]
+# Воркеров задаём здесь же, в мастере: так mprime сам сообщит серверу тип работы КАЖДОГО воркера (если добавить
+# воркер потом правкой prime.txt, сервер о его типе работы не знает и выдаёт ему что угодно: double-check, PRP).
 
 set timeout 600
 set USERID   [lindex $argv 0]
@@ -9,6 +11,8 @@ set COMPUTER [lindex $argv 1]
 set TYPE     [lindex $argv 2]
 set CORES    [lindex $argv 3]
 set MEM      [lindex $argv 4]
+set WORKERS  [lindex $argv 5]
+if {$WORKERS eq ""} { set WORKERS 1 }
 
 spawn ./mprime -m
 expect "Join Gimps? (*):"
@@ -22,7 +26,7 @@ sleep 1; send -- "$COMPUTER\r"
 expect {
 	"Type of work to get (*):"            { sleep 1; send -- "$TYPE\r"; exp_continue }
 	"stage 2 memory in GiB (*):"          { sleep 1; send -- "$MEM\r"; exp_continue }
-	"*umber of workers*(*):"              { sleep 1; send -- "1\r"; exp_continue }
+	"*umber of workers*(*):"              { sleep 1; send -- "$WORKERS\r"; exp_continue }
 	"*ores to use*(*):"                   { sleep 1; send -- "$CORES\r"; exp_continue }
 	"*ores per test*(*):"                 { sleep 1; send -- "$CORES\r"; exp_continue }
 	"Upload bandwidth limit in Mbps (*):" { sleep 1; send -- "10000\r"; exp_continue }

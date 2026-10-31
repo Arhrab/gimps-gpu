@@ -241,6 +241,7 @@ cat > "$D/gimps-start" <<'__GIMPS_EOF__'
 #   PRP_PROOF_POWER  proof power для PRP (по умолч. 6: 64 остатка, ~1,1 ГБ на тест 140M)
 #   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ, сообщается PrimeNet. По умолч. 5
 #   GPU_SELFTEST     1 (по умолч.) = перед работой PRP-самотест GPU на известном простом M1257787 (раз в сутки)
+#   GPU_SELFTEST_MAX_MIN  предел времени самотеста, мин (по умолч. 60); не уложился — GPU не выключается
 #   WATCHDOG_MIN     перезапустить воркер, если его лог молчит дольше N минут. По умолч. 20 (0 — выкл.)
 #   EE_MAX_PER_HOUR  выключить PRP-воркер, если ошибок Gerbicz (EE) больше N за час. По умолч. 3
 #   APN_ARGS         доп. аргументы AutoPrimeNet (напр. "--cert-work")
@@ -289,8 +290,21 @@ fi
 # поэтому повторный запуск откажет, пока жив хотя бы один процесс прошлого запуска.
 exec 8>"$DATA_DIR/.gimps-start.lock"
 if ! flock -n 8; then
-  echo "[$(date '+%F %T')] gimps-start уже работает (или остались его воркеры). Статус: gimps-status; остановить: gimps-stop" >&2
-  exit 1
+  # Блокировку могли оставить «подвисшие» циклы прошлого запуска (после gimps-stop они досыпают паузу).
+  # Если никаких расчётов на самом деле не идёт — добиваем остатки и берём блокировку, иначе отказываем.
+  if pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null; then
+    echo "[$(date '+%F %T')] gimps-start уже работает. Статус: gimps-status; остановить: gimps-stop" >&2
+    exit 1
+  fi
+  echo "[$(date '+%F %T')] блокировку держат остатки прошлого запуска (расчётов нет) — убираю их" >&2
+  pkill -TERM -f 'bash .*/gimps-start' 2>/dev/null
+  pkill -f '^python3 .*autoprimenet\.py ' 2>/dev/null; sleep 3
+  pkill -KILL -f 'bash .*/gimps-start' 2>/dev/null; sleep 1
+  exec 8>"$DATA_DIR/.gimps-start.lock"
+  if ! flock -n 8; then
+    echo "[$(date '+%F %T')] не удалось освободить блокировку. Выполните: gimps-stop, затем gimps-start --daemon" >&2
+    exit 1
+  fi
 fi
 # одинаковая нумерация GPU у CUDA, OpenCL и nvidia-smi (иначе CUDA ставит «самую быструю» первой)
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -442,7 +456,7 @@ shutdown() {
   touch "$STOP_FLAG"
   pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
   for _ in $(seq 1 90); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
-  pkill -f '^python3 .*autoprimenet.py -w'
+  pkill -f '^python3 .*autoprimenet\.py '
   pkill -f '^python3 .*gimps-monitor'
   if [ "$BACKUP_ON" = "1" ] && [ $by_stop = 0 ]; then
     log "Финальный бэкап во внешнее хранилище..."
@@ -500,6 +514,7 @@ prpll_tune() {
       local tmax="${PRPLL_TUNE_MAX_MIN:-20}"
       plog "GPU $g: ТЮНИНГ PRPLL под $name (-tune $args), обычно 5–15 мин, не дольше $tmax мин; ход — в gimps-watch, лог logs/tune-gpu$g.log"
       local tdir; tdir="$(mktemp -d "$DATA_DIR/tune-run.XXXX")"
+      mkdir -p "$PWD/kernel-cache" && ln -sfn "$PWD/kernel-cache" "$tdir/kernel-cache"   # ядра — в общий кэш воркера
       ( cd "$tdir" && timeout -k 30 "$(( tmax * 60 ))" "$PRPLL_BIN" -d 0 -dir "$tdir" -cache -tune "$args" >>"$DATA_DIR/logs/tune-gpu$g.log" 2>&1 )
       [ $? -eq 124 ] && log "GPU $g: тюнинг прерван по лимиту $tmax мин (PRPLL_TUNE_MAX_MIN)"
       if [ -s "$tdir/tune.txt" ]; then
@@ -529,11 +544,21 @@ gpu_selftest() {
   if [ -f "$ok" ] && [ $(( $(date +%s) - $(stat -c %Y "$ok") )) -lt 86400 ]; then return 0; fi
   local t; t="$(mktemp -d "$DATA_DIR/tune-run.st.XXXX")"
   plog "GPU $g: самотест PRPLL (M1257787 — известное простое)…"
-  ( cd "$t" && timeout 1200 "$PRPLL_BIN" -d 0 -dir "$t" -prp 1257787 -proof 0 >>"$DATA_DIR/logs/selftest-gpu$g.log" 2>&1 )
+  # кэш скомпилированных ядер — общий с воркером (папка воркера = текущая): на машинах со слабым CPU
+  # (Xeon Phi и т.п.) компиляция ядер NVRTC идёт десятки минут, второй раз её делать незачем
+  mkdir -p "$PWD/kernel-cache" && ln -sfn "$PWD/kernel-cache" "$t/kernel-cache"
+  local rc
+  ( cd "$t" && timeout -k 30 "${GPU_SELFTEST_MAX_MIN:-60}m" stdbuf -oL -eL "$PRPLL_BIN" -d 0 -dir "$t" -cache -prp 1257787 -proof 0 \
+      >>"$DATA_DIR/logs/selftest-gpu$g.log" 2>&1 ); rc=$?
   if grep -qE '"status" *: *"P"' "$t"/results*.txt 2>/dev/null; then
     touch "$ok"; rm -rf "$t"; plog "GPU $g: самотест пройден"; return 0
   fi
   rm -rf "$t"
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+    # не успел — это не ошибка вычислений (обычно медленная компиляция ядер на слабом CPU): не выключаем GPU
+    plog "GPU $g: самотест не уложился в ${GPU_SELFTEST_MAX_MIN:-60} мин (медленный CPU?) — пропускаю, работа продолжится"
+    return 0
+  fi
   if grep -q 'cuInit failed' "$DATA_DIR/logs/selftest-gpu$g.log" 2>/dev/null; then
     plog "ОШИБКА: GPU $g: CUDA не инициализируется (cuInit failed) — драйвер/хост неисправен, смените машину"
   fi
@@ -624,7 +649,7 @@ dirs=( "$DATA_DIR"/prp-gpu* "$DATA_DIR"/tf-gpu* )
 each_dir() { for d in "${dirs[@]}"; do [ -f "$d/prime.ini" ] && { echo "== $d"; $APN -w "$d" "$@"; }; done; }
 
 if [ "${1:-}" = "--finish" ]; then
-  pkill -f '^python3 .*autoprimenet.py -w'; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
+  pkill -f '^python3 .*autoprimenet\.py '; sleep 2     # AutoPrimeNet держит lock; цикл в gimps-start перезапустит его через минуту
   each_dir --no-more-work
   echo "GPU: новые задания больше не берутся. Когда gimps-status покажет пустую очередь — можно останавливать."
   echo "     Запрет сохраняется при перезапуске этой машины; на машине, продолжившей слот из бэкапа, снимается сам."
@@ -637,8 +662,8 @@ touch "$DATA_DIR/.stop"
 pkill -TERM -x prpll-cuda; pkill -TERM -x prpll-ocl; pkill -TERM -x mfaktc; pkill -INT -x mprime
 echo "Жду сохранения чекпойнтов..."
 for _ in $(seq 1 120); do pgrep -x 'prpll-cuda|prpll-ocl|mfaktc|mprime' >/dev/null || break; sleep 1; done
-pkill -f '^python3 .*autoprimenet.py -w'
-for _ in $(seq 1 15); do pgrep -f '^python3 .*autoprimenet.py -w' >/dev/null || break; sleep 1; done
+pkill -f '^python3 .*autoprimenet\.py '
+for _ in $(seq 1 15); do pgrep -f '^python3 .*autoprimenet\.py ' >/dev/null || break; sleep 1; done
 echo "Отправляю результаты и proof-файлы..."
 each_dir --upload-proofs
 backup_on=0
@@ -655,7 +680,7 @@ fi
 # gimps-start и его фоновые циклы должны выйти сами (стоп-флаг); если кто-то задержался — завершаем принудительно
 for _ in $(seq 1 30); do pgrep -f 'bash .*/gimps-start' >/dev/null || break; sleep 1; done
 pkill -TERM -f 'bash .*/gimps-start' 2>/dev/null; sleep 3; pkill -KILL -f 'bash .*/gimps-start' 2>/dev/null
-pkill -f '^python3 .*autoprimenet.py -w' 2>/dev/null; pkill -f 'python3 .*/gimps-monitor' 2>/dev/null
+pkill -f '^python3 .*autoprimenet\.py ' 2>/dev/null; pkill -f 'python3 .*/gimps-monitor' 2>/dev/null
 echo "Готово. Запуск заново: gimps-start --daemon"
 __GIMPS_EOF__
 cat > "$D/gimps-status" <<'__GIMPS_EOF__'
@@ -1736,7 +1761,11 @@ mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
 if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
   mem_kb=$(( $(cat /sys/fs/cgroup/memory.max) / 1024 ))
 fi
-MEM="${CPU_MEM_GB:-$(( mem_kb / 1024 / 1024 / 2 ))}"; [ "$MEM" -gt 64 ] && MEM=64; [ "$MEM" -lt 1 ] && MEM=1
+# авто: половина памяти контейнера, но не больше 64 ГиБ (больше P-1 stage 2 обычно не окупает);
+# явный CPU_MEM_GB этим потолком НЕ ограничивается — на машинах с сотнями ГБ есть смысл задать больше
+if [ -n "${CPU_MEM_GB:-}" ]; then MEM="$CPU_MEM_GB"
+else MEM=$(( mem_kb / 1024 / 1024 / 2 )); [ "$MEM" -gt 64 ] && MEM=64; fi
+[ "$MEM" -lt 1 ] && MEM=1
 
 # Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
 # каждом старте задаём их заново. mprime 30.x хранит их в prime.txt (раньше — в local.txt); правим оба, если есть.
@@ -1750,6 +1779,12 @@ enforce_cores() {
     done
     grep -q '^Memory=' "$f" && sed -i "s/^Memory=.*/Memory=$mem_mb during 7:30-23:30 else $mem_mb/" "$f"
   done
+  # чекпойнт mprime раз в 10 мин (по умолчанию 30): облачные хосты иногда перезапускают контейнер без
+  # предупреждения, и всё посчитанное после последнего сохранения теряется
+  if [ -f prime.txt ]; then
+    if grep -q '^DiskWriteTime=' prime.txt; then sed -i "s/^DiskWriteTime=.*/DiskWriteTime=${CPU_SAVE_MIN:-10}/" prime.txt
+    else sed -i "1i DiskWriteTime=${CPU_SAVE_MIN:-10}" prime.txt; fi
+  fi
   # тип работы — каждому воркеру явно (иначе новый воркер получает от сервера что угодно: PRP, double-check…)
   [ -f prime.txt ] || return 0
   sed -i "s/^WorkPreference=.*/WorkPreference=$type/" prime.txt
@@ -1781,8 +1816,45 @@ clean_orphans() {
 }
 clean_orphans
 
+# Подстраховка: если у какого-то воркера нет P-1 (новый воркер, восстановление из бэкапа другой машины), отдаём
+# ему часть очереди P-1 соседа, пока mprime не запущен, — иначе он сам запросит работу и может получить не P-1.
+rebalance() {
+  [ "$WORKERS" -ge 2 ] && [ -s worktodo.txt ] || return 0
+  python3 - "$WORKERS" <<'PY'
+import re, sys
+n = int(sys.argv[1]); p = "worktodo.txt"
+sec, cur = {}, 1
+for line in open(p).read().split("\n"):
+    m = re.match(r"\[Worker #(\d+)\]", line.strip())
+    if m: cur = int(m[1]); sec.setdefault(cur, []); continue
+    if line.strip(): sec.setdefault(cur, []).append(line)
+for w in range(1, n + 1): sec.setdefault(w, [])
+pf = lambda w: [l for l in sec[w] if l.startswith("Pfactor=")]
+moved = 0
+# задания не-P-1 (PRP, double-check — достались от старых настроек) переносим в конец очереди своего воркера:
+# P-1 на CPU даёт в разы больше работы за то же время, а начатый PRP не теряется — он досчитается позже
+for w in sec:
+    pfl = [l for l in sec[w] if l.startswith("Pfactor=")]
+    if pfl and sec[w] and not sec[w][0].startswith("Pfactor="):
+        sec[w] = pfl + [l for l in sec[w] if not l.startswith("Pfactor=")]; moved += 1
+for w in range(1, n + 1):
+    if pf(w): continue
+    donor = max(sec, key=lambda d: len(pf(d)))
+    give = pf(donor)[1:][len(pf(donor)[1:]) // 2:]          # первую (начатую) задачу донора не трогаем
+    if not give: continue
+    for l in give: sec[donor].remove(l)
+    sec[w] = give + sec[w]; moved += len(give)
+if moved:
+    out = []
+    for w in sorted(sec):
+        out += [f"[Worker #{w}]"] + sec[w] + [""]
+    open(p, "w").write("\n".join(out))
+    print(f"mprime: очередь перестроена (P-1 — первыми у каждого воркера), изменений: {moved}")
+PY
+}
+
 if [ "${1:-}" != "--force" ] && grep -qs '^V5UserID=' prime.txt; then
-  enforce_cores
+  enforce_cores; rebalance
   echo "mprime уже настроен ($D/prime.txt); для этой машины: воркеров $WORKERS × $PER ядер, память stage 2 $MEM ГиБ. Перенастроить: gimps-cpu-setup --force"; exit 0
 fi
 
@@ -1791,10 +1863,10 @@ NAME="${GIMPS_NAME:-cloud}-cpu"
 TYPE="${CPU_WORKPREF:-4}"
 echo "mprime: пользователь=$USERID, компьютер=$NAME, тип работы=$TYPE, ядер=$CORES (выделено CPU: $alloc), память stage 2=$MEM ГиБ"
 [ "${1:-}" = "--force" ] && rm -f prime.txt local.txt
-timeout 900 expect /opt/gimps/share/mprime-setup.exp "$USERID" "$NAME" "$TYPE" "$PER" "$MEM" > setup.log 2>&1
+timeout 900 expect /opt/gimps/share/mprime-setup.exp "$USERID" "$NAME" "$TYPE" "$PER" "$MEM" "$WORKERS" > setup.log 2>&1
 rc=$?
 if grep -qs '^V5UserID=' prime.txt; then
-  enforce_cores
+  enforce_cores; rebalance
   echo "mprime настроен (лог: $D/setup.log), воркеров: $WORKERS × $PER ядер"; exit 0
 fi
 echo "mprime: автонастройка не удалась (rc=$rc), см. $D/setup.log. Можно настроить вручную: cd $D && ./mprime -m"
@@ -1855,7 +1927,9 @@ cat > "$D/mprime-setup.exp" <<'__GIMPS_EOF__'
 #!/usr/bin/expect -f
 # Первичная настройка mprime без вопросов (на основе mprime.exp из
 # github.com/tdulcet/Distributed-Computing-Scripts, MIT License, © Teal Dulcet).
-# Запуск: expect mprime-setup.exp <User ID> <Computer name> <Type of work> <CPU cores> <Stage 2 memory GiB>
+# Запуск: expect mprime-setup.exp <User ID> <Computer name> <Type of work> <CPU cores per worker> <Stage 2 memory GiB> [workers]
+# Воркеров задаём здесь же, в мастере: так mprime сам сообщит серверу тип работы КАЖДОГО воркера (если добавить
+# воркер потом правкой prime.txt, сервер о его типе работы не знает и выдаёт ему что угодно: double-check, PRP).
 
 set timeout 600
 set USERID   [lindex $argv 0]
@@ -1863,6 +1937,8 @@ set COMPUTER [lindex $argv 1]
 set TYPE     [lindex $argv 2]
 set CORES    [lindex $argv 3]
 set MEM      [lindex $argv 4]
+set WORKERS  [lindex $argv 5]
+if {$WORKERS eq ""} { set WORKERS 1 }
 
 spawn ./mprime -m
 expect "Join Gimps? (*):"
@@ -1876,7 +1952,7 @@ sleep 1; send -- "$COMPUTER\r"
 expect {
 	"Type of work to get (*):"            { sleep 1; send -- "$TYPE\r"; exp_continue }
 	"stage 2 memory in GiB (*):"          { sleep 1; send -- "$MEM\r"; exp_continue }
-	"*umber of workers*(*):"              { sleep 1; send -- "1\r"; exp_continue }
+	"*umber of workers*(*):"              { sleep 1; send -- "$WORKERS\r"; exp_continue }
 	"*ores to use*(*):"                   { sleep 1; send -- "$CORES\r"; exp_continue }
 	"*ores per test*(*):"                 { sleep 1; send -- "$CORES\r"; exp_continue }
 	"Upload bandwidth limit in Mbps (*):" { sleep 1; send -- "10000\r"; exp_continue }
