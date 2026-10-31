@@ -238,6 +238,7 @@ cat > "$D/gimps-start" <<'__GIMPS_EOF__'
 #   PRPLL_TUNE_MAX_MIN  предел времени тюнинга, мин. По умолч. 20 (не уложился — работа с настройками по умолчанию)
 #   PRPLL_CACHE      1 (по умолч.) = кэш скомпилированных ядер PRPLL (-cache): быстрый перезапуск
 #   PRPLL_ARGS       доп. аргументы PRPLL
+#   PRPLL_FFT        FFT для PRPLL: auto (по умолч.; свой выбор для RTX 4080), <спецификация> или 0
 #   PRP_PROOF_POWER  proof power для PRP (по умолч. 6: 64 остатка, ~1,1 ГБ на тест 140M)
 #   PROOF_DISK_GB    диск под proof-файлы на один GPU, ГБ, сообщается PrimeNet. По умолч. 5
 #   GPU_SELFTEST     1 (по умолч.) = перед работой PRP-самотест GPU на известном простом M1257787 (раз в сутки)
@@ -535,6 +536,23 @@ prpll_tune() {
   return 0
 }
 
+# FFT для моделей, где тюнинг PRPLL выбирает не лучший вариант (замер на RTX 4080, ~160–165M: тюнинг дал
+# 3.5M тип 4 — 400 мкс/ит, а 4M тип 1 — 333 мкс/ит). Только для экспонент до 170M: дальше у 4M мало запаса по bpw.
+# PRPLL_FFT=<спецификация> — вручную для всех GPU, PRPLL_FFT=0 — не вмешиваться; -fft в PRPLL_ARGS главнее.
+prpll_fft_args() {
+  local g="$1" dir="$2" name="$3" fft="${PRPLL_FFT:-auto}" r hi
+  [[ " ${PRPLL_ARGS:-} " == *" -fft "* || "$fft" = "0" ]] && return 0
+  if [ "$fft" = "auto" ]; then
+    fft=""
+    case "$name" in *"RTX 4080"*) fft="1:512:8:512:202" ;; esac
+    [ -z "$fft" ] && return 0
+    r="$(tune_range "$dir")"; hi="${r##*-}"; hi="${hi%M}"
+    if ! [[ "$hi" =~ ^[0-9]+$ ]] || [ "$hi" -gt 170 ]; then return 0; fi
+  fi
+  log "GPU $g: FFT $fft (PRPLL_FFT; отключить: PRPLL_FFT=0)" >&2
+  echo "-fft $fft"
+}
+
 # Самотест GPU: PRP-тест известного простого M1257787 (секунды–минуты) в отдельной папке — результат
 # никуда не отправляется. Не прошёл → воркер этой GPU выключен (.disabled-prp-gpuN) и приходит уведомление.
 gpu_selftest() {
@@ -611,7 +629,8 @@ for g in "${GPUS[@]}"; do
     # shellcheck disable=SC2086
     ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && prpll_tune "$g" "$dir" "$gpu_name" \
         && gpu_selftest "$g" "$gpu_name" \
-        && forever "prp-gpu$g" stdbuf -oL -eL "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" ${PRPLL_ARGS:-} ) &
+        && fftargs="$(prpll_fft_args "$g" "$dir" "$gpu_name")" \
+        && forever "prp-gpu$g" stdbuf -oL -eL "$PRPLL_BIN" -d 0 -dir "$dir" -user "$GIMPS_USER" $fftargs ${PRPLL_ARGS:-} ) &
   else
     # mfaktc при каждом запуске сам прогоняет короткий самотест и не стартует, если он не прошёл
     ( cd "$dir" && export CUDA_VISIBLE_DEVICES="$g" && forever "tf-gpu$g" stdbuf -oL -eL mfaktc -d 0 ) &
@@ -1756,15 +1775,15 @@ CORES="${CPU_CORES:-$(( phys > ngpu ? phys - ngpu : 1 ))}"
 WORKERS="${CPU_WORKERS:-$(( CORES >= 4 ? 2 : 1 ))}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
 PER=$(( CORES / WORKERS )); [ "$PER" -lt 1 ] && PER=1
 
-# память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
+# память: половина лимита контейнера (или RAM), но не больше 64 ГиБ на воркер
 mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
 if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
   mem_kb=$(( $(cat /sys/fs/cgroup/memory.max) / 1024 ))
 fi
-# авто: половина памяти контейнера, но не больше 64 ГиБ (больше P-1 stage 2 обычно не окупает);
-# явный CPU_MEM_GB этим потолком НЕ ограничивается — на машинах с сотнями ГБ есть смысл задать больше
+# авто: половина памяти контейнера, но не больше 64 ГиБ на воркер (больше P-1 stage 2 обычно не окупает);
+# mprime делит Memory между воркерами, которые одновременно в stage 2. Явный CPU_MEM_GB потолком не ограничен
 if [ -n "${CPU_MEM_GB:-}" ]; then MEM="$CPU_MEM_GB"
-else MEM=$(( mem_kb / 1024 / 1024 / 2 )); [ "$MEM" -gt 64 ] && MEM=64; fi
+else MEM=$(( mem_kb / 1024 / 1024 / 2 )); [ "$MEM" -gt $(( 64 * WORKERS )) ] && MEM=$(( 64 * WORKERS )); fi
 [ "$MEM" -lt 1 ] && MEM=1
 
 # Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
@@ -1784,6 +1803,13 @@ enforce_cores() {
   if [ -f prime.txt ]; then
     if grep -q '^DiskWriteTime=' prime.txt; then sed -i "s/^DiskWriteTime=.*/DiskWriteTime=${CPU_SAVE_MIN:-10}/" prime.txt
     else sed -i "1i DiskWriteTime=${CPU_SAVE_MIN:-10}" prime.txt; fi
+  fi
+  # stage 2 сразу у всех воркеров: по умолчанию mprime пускает в «тяжёлую по памяти» фазу ограниченное число
+  # воркеров, остальные откладывают stage 2 и начинают stage 1 следующего задания
+  # («Exceeded limit on number of workers that can use lots of memory»)
+  if [ -f prime.txt ]; then
+    if grep -q '^MaxHighMemWorkers=' prime.txt; then sed -i "s/^MaxHighMemWorkers=.*/MaxHighMemWorkers=$WORKERS/" prime.txt
+    else sed -i "1i MaxHighMemWorkers=$WORKERS" prime.txt; fi
   fi
   # тип работы — каждому воркеру явно (иначе новый воркер получает от сервера что угодно: PRP, double-check…)
   [ -f prime.txt ] || return 0

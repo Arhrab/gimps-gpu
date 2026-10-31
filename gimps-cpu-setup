@@ -38,15 +38,15 @@ CORES="${CPU_CORES:-$(( phys > ngpu ? phys - ngpu : 1 ))}"
 WORKERS="${CPU_WORKERS:-$(( CORES >= 4 ? 2 : 1 ))}"; [ "$WORKERS" -lt 1 ] && WORKERS=1
 PER=$(( CORES / WORKERS )); [ "$PER" -lt 1 ] && PER=1
 
-# память: половина лимита контейнера (или RAM), но не больше 64 ГиБ
+# память: половина лимита контейнера (или RAM), но не больше 64 ГиБ на воркер
 mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
 if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
   mem_kb=$(( $(cat /sys/fs/cgroup/memory.max) / 1024 ))
 fi
-# авто: половина памяти контейнера, но не больше 64 ГиБ (больше P-1 stage 2 обычно не окупает);
-# явный CPU_MEM_GB этим потолком НЕ ограничивается — на машинах с сотнями ГБ есть смысл задать больше
+# авто: половина памяти контейнера, но не больше 64 ГиБ на воркер (больше P-1 stage 2 обычно не окупает);
+# mprime делит Memory между воркерами, которые одновременно в stage 2. Явный CPU_MEM_GB потолком не ограничен
 if [ -n "${CPU_MEM_GB:-}" ]; then MEM="$CPU_MEM_GB"
-else MEM=$(( mem_kb / 1024 / 1024 / 2 )); [ "$MEM" -gt 64 ] && MEM=64; fi
+else MEM=$(( mem_kb / 1024 / 1024 / 2 )); [ "$MEM" -gt $(( 64 * WORKERS )) ] && MEM=$(( 64 * WORKERS )); fi
 [ "$MEM" -lt 1 ] && MEM=1
 
 # Ядра и память — свойства КОНКРЕТНОЙ машины, а папка cpu/ переезжает между машинами через бэкап. Поэтому при
@@ -66,6 +66,13 @@ enforce_cores() {
   if [ -f prime.txt ]; then
     if grep -q '^DiskWriteTime=' prime.txt; then sed -i "s/^DiskWriteTime=.*/DiskWriteTime=${CPU_SAVE_MIN:-10}/" prime.txt
     else sed -i "1i DiskWriteTime=${CPU_SAVE_MIN:-10}" prime.txt; fi
+  fi
+  # stage 2 сразу у всех воркеров: по умолчанию mprime пускает в «тяжёлую по памяти» фазу ограниченное число
+  # воркеров, остальные откладывают stage 2 и начинают stage 1 следующего задания
+  # («Exceeded limit on number of workers that can use lots of memory»)
+  if [ -f prime.txt ]; then
+    if grep -q '^MaxHighMemWorkers=' prime.txt; then sed -i "s/^MaxHighMemWorkers=.*/MaxHighMemWorkers=$WORKERS/" prime.txt
+    else sed -i "1i MaxHighMemWorkers=$WORKERS" prime.txt; fi
   fi
   # тип работы — каждому воркеру явно (иначе новый воркер получает от сервера что угодно: PRP, double-check…)
   [ -f prime.txt ] || return 0
